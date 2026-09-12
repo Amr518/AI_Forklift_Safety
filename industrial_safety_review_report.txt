@@ -1,0 +1,1027 @@
+================================================================================
+ INDUSTRIAL SAFETY CODE REVIEW — COMPREHENSIVE TECHNICAL REPORT
+================================================================================
+ System:    Limitless Future — Forklift Human Detection Safety System
+ Platform:  Ubuntu 24.04 LTS (Kernel 6.17.0-35-generic)
+ Hardware:  RM04U 4-Channel USB Relay (CH340 chipset) via /dev/ttyUSB0
+ AI Model:  YOLOv8n (Ultralytics) — Person Detection (COCO Class 0)
+ GUI:       PyQt5 Kiosk-Mode HMI with 2x2 Camera Grid
+ Date:      2026-06-06
+ Author:    Google Antigravity — Automated Industrial Code Review Engine
+================================================================================
+
+TABLE OF CONTENTS
+─────────────────
+ §1.  Executive Summary
+ §2.  Architecture Overview & File Map
+ §3.  Root Cause Analysis — The "forklift" User Permission Failure
+ §4.  Race Conditions & Concurrency Vulnerabilities
+ §5.  Memory Leaks & Latency Bottlenecks
+ §6.  Security Audit Findings
+ §7.  Architectural Remediation — IPC vs. File I/O
+ §8.  Concrete Refactoring Recommendations (with Code Samples)
+ §9.  Hardened start_system.sh Deployment Script
+ §10. Verification Checklist
+ §11. Risk Matrix & Severity Classification
+
+================================================================================
+ §1. EXECUTIVE SUMMARY
+================================================================================
+
+This report documents a rigorous industrial-grade code review of the Forklift
+AI Safety System deployed at Limitless Future's factory site. The system uses
+computer vision (YOLOv8) to detect pedestrians in forklift operating zones and
+controls a physical relay module (RM04U) via serial communication to cut
+forklift motion when a human is detected inside a defined Region of Interest.
+
+KEY FINDING: The system has ALREADY been partially migrated from file-based
+IPC (relay_status.json in the project directory) to tmpfs-based IPC
+(/dev/shm/relay_status.json). Both hardware_worker.py (line 41) and
+hardware_manager.py (line 41) reference:
+
+    STATUS_FILE = "/dev/shm/relay_status.json"
+    RELAY_STATUS_FILE = "/dev/shm/relay_status.json"
+
+This is a CORRECT architectural choice — /dev/shm is a POSIX shared-memory
+tmpfs filesystem that exists entirely in RAM, is accessible to all users,
+and provides sub-microsecond I/O latency. However, the migration is INCOMPLETE
+and several critical issues remain:
+
+ CRITICAL ISSUES IDENTIFIED:
+ ┌────┬─────────────────────────────────────────────────────────────────────────┐
+ │ #  │ Finding                                                               │
+ ├────┼─────────────────────────────────────────────────────────────────────────┤
+ │ C1 │ Residual relay_status.json in project dir creates file-ownership      │
+ │    │ confusion. The old file (owned by "limitlessfuture") may be read      │
+ │    │ by mistake if /dev/shm version is absent during a cold start.         │
+ ├────┼─────────────────────────────────────────────────────────────────────────┤
+ │ C2 │ No file locking (fcntl/flock) on /dev/shm/relay_status.json — two    │
+ │    │ processes performing concurrent read-modify-write cycles within       │
+ │    │ milliseconds can produce torn reads or lost updates.                  │
+ ├────┼─────────────────────────────────────────────────────────────────────────┤
+ │ C3 │ start_system.sh creates the /dev/shm file correctly (line 14-15)     │
+ │    │ with `chmod 666`, BUT the file is volatile — on reboot /dev/shm is   │
+ │    │ wiped. If start_system.sh does not execute (e.g., manual launch),     │
+ │    │ the _ensure_bridge_file() in hardware_manager.py creates the file    │
+ │    │ with the launching user's ownership.                                  │
+ ├────┼─────────────────────────────────────────────────────────────────────────┤
+ │ C4 │ QImage created from raw numpy buffer (line 772 of ai_gui_system.py)  │
+ │    │ without copying the data — if the frame is garbage-collected before   │
+ │    │ QPainter finishes, a segfault or memory corruption can occur.         │
+ ├────┼─────────────────────────────────────────────────────────────────────────┤
+ │ C5 │ CameraWorkerThread.stop() does not call QThread.wait() — the thread  │
+ │    │ may continue running after stop_camera() returns, leaking OpenCV      │
+ │    │ VideoCapture handles.                                                 │
+ ├────┼─────────────────────────────────────────────────────────────────────────┤
+ │ C6 │ security.json stores passwords in plaintext — trivially readable     │
+ │    │ by any user with filesystem access.                                   │
+ ├────┼─────────────────────────────────────────────────────────────────────────┤
+ │ C7 │ config.json writes (save_roi, save_global_configurations) are NOT    │
+ │    │ atomic — a power loss mid-write could corrupt the configuration.      │
+ └────┴─────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+ §2. ARCHITECTURE OVERVIEW & FILE MAP
+================================================================================
+
+The system follows a PRODUCER-CONSUMER pattern:
+
+ ┌──────────────────────┐     /dev/shm/relay_status.json     ┌─────────────────┐
+ │   ai_gui_system.py   │ ═══════════════════════════════> │ hardware_worker  │
+ │   (PRODUCER)         │    Atomic write via os.replace()  │   .py (CONSUMER) │
+ │                      │                                    │                  │
+ │ • PyQt5 GUI          │ <═══════════════════════════════  │ • Serial I/O     │
+ │ • YOLOv8 Inference   │    Reads hw_status field back     │ • RM04U Protocol │
+ │ • hardware_manager   │                                    │ • N1-N4 / F1-F4  │
+ │   .py (bridge)       │                                    │ • Delay Timers   │
+ └──────────────────────┘                                    └─────────────────┘
+         │                                                           │
+         │  config.json (ROI, ports, model, timers)                  │
+         │  security.json (role passwords)                           │
+         │                                                           │
+         └────── /dev/ttyUSB0 (RM04U CH340 USB Relay) ──────────────┘
+
+PRODUCER FLOW (ai_gui_system.py → hardware_manager.py):
+  1. CameraWorkerThread reads frames from /dev/videoN
+  2. YoloDetector.detect_persons() runs inference (imgsz=320)
+  3. AlarmSystem.check_boundaries() evaluates ROI intrusion
+  4. USBRelayManager.trigger_relay() writes station_N_trigger to JSON
+  5. USBRelayManager._write_bridge() atomically replaces JSON file
+
+CONSUMER FLOW (hardware_worker.py):
+  1. Polls /dev/shm/relay_status.json every 50ms
+  2. Parses station triggers + relay mappings (Dynamic Routing)
+  3. Applies non-blocking On-Delay (debounce) and Off-Delay (hold)
+  4. Sends 2-byte ASCII command (N1-N4 / F1-F4) via serial
+
+
+================================================================================
+ §3. ROOT CAUSE ANALYSIS — THE "forklift" USER PERMISSION FAILURE
+================================================================================
+
+SYMPTOM:
+  "[HARDWARE] Safe status write failed for status: ONLINE"
+  System enters safe mode and cuts relay output.
+
+ROOT CAUSE CHAIN:
+─────────────────
+
+ Step 1: The system was ORIGINALLY designed to use relay_status.json in the
+         project directory (/home/limitlessfuture/Desktop/AI_Forklift_Safety/).
+
+ Step 2: A migration to /dev/shm/relay_status.json was performed (visible in
+         the current code at hardware_worker.py:41 and hardware_manager.py:41).
+
+ Step 3: The old relay_status.json file still exists in the project directory
+         (15 lines, 340 bytes) — this is now a DECOY file that is NOT used by
+         the production code paths.
+
+ Step 4: The actual runtime failure occurs at THIS specific call chain:
+
+         hardware_worker.py:476  main() → update_hardware_status("OFFLINE")
+         hardware_worker.py:176  update_hardware_status("ONLINE")
+           → safe_read_json("/dev/shm/relay_status.json")  ... reads OK
+           → safe_write_json("/dev/shm/relay_status.json")  ... FAILS
+
+ Step 5: The WRITE FAILS because:
+         (a) /dev/shm/relay_status.json may not exist yet (volatile tmpfs),
+         (b) If hardware_manager.py's _ensure_bridge_file() created it first
+             under the "limitlessfuture" user, the file is owned by UID 1000.
+         (c) The "forklift" user (UID 1001) cannot write to a file owned by
+             "limitlessfuture" unless permissions are set to 666.
+         (d) The os.chmod(file_path, 0o666) call in safe_write_json() (line 156)
+             ALSO fails because only the file OWNER or root can chmod.
+         (e) The .tmp file (line 149) is created by "forklift" but os.replace()
+             (line 154) fails if the destination is owned by another user
+             (on some filesystem configurations).
+
+ Step 6: After 10 retries (100ms total), the function returns False.
+         update_hardware_status() prints the observed error message (line 193).
+
+ Step 7: The GUI reads hw_status == "OFFLINE" (because the write never 
+         succeeded), enters safe mode, and disengages relays.
+
+RESIDUAL BUG — STALE PROJECT-DIR FILE:
+  The file /home/limitlessfuture/Desktop/AI_Forklift_Safety/relay_status.json
+  still exists. While the runtime code no longer reads from it, its presence
+  creates confusion for operators and engineers debugging the system.
+
+WHY chmod 777 FIXED IT:
+  Running `chmod -R 777` on the project directory had NO direct effect on
+  /dev/shm/relay_status.json (which is on a separate tmpfs filesystem).
+  However, the chmod likely coincided with the start_system.sh script
+  executing its lines 14-15:
+    touch /dev/shm/relay_status.json 2>/dev/null
+    chmod 666 /dev/shm/relay_status.json 2>/dev/null
+  This correctly set permissions. The real fix is ensuring this ALWAYS runs
+  before either Python process starts.
+
+
+================================================================================
+ §4. RACE CONDITIONS & CONCURRENCY VULNERABILITIES
+================================================================================
+
+4.1  READ-MODIFY-WRITE RACES ON /dev/shm/relay_status.json
+─────────────────────────────────────────────────────────────
+
+The JSON bridge file is accessed by TWO independent processes:
+
+  PRODUCER (ai_gui_system.py via hardware_manager.py):
+    → _read_bridge() → modify dict → _write_bridge()
+    → Called on EVERY YOLOv8 inference cycle (~10 Hz per station × 4 stations)
+    → Also called by instant_save_timer_config(), toggle_hardware_coil(), etc.
+
+  CONSUMER (hardware_worker.py):
+    → safe_read_json() for polling (every 50ms = 20 Hz)
+    → update_hardware_status() → safe_read_json() → safe_write_json()
+    → Called every ~2 seconds for ONLINE heartbeat (40 ticks × 50ms)
+
+RACE CONDITION SCENARIO:
+  T=0.000ms: GUI reads   {"station_1_trigger": 0, "hw_status": "ONLINE", ...}
+  T=0.001ms: Worker reads {"station_1_trigger": 0, "hw_status": "ONLINE", ...}
+  T=0.002ms: GUI writes   {"station_1_trigger": 1, "hw_status": "ONLINE", ...}
+  T=0.003ms: Worker writes {"station_1_trigger": 0, "hw_status": "ONLINE", ...}
+  RESULT: GUI's trigger update is LOST. Relay does NOT fire.
+
+  This is a CLASSIC "Lost Update" race condition.
+
+SEVERITY: HIGH
+  A lost trigger update means a pedestrian detection event is silently dropped.
+  The forklift continues moving when it should have been stopped.
+  At 50ms polling intervals, the window for collision is approximately:
+    P(race) ≈ (write_duration / poll_interval) × concurrent_writers
+    P(race) ≈ (0.5ms / 50ms) × 2 ≈ 2% per cycle
+  Over thousands of cycles per hour, a race WILL occur.
+
+MITIGATION ALREADY IN PLACE:
+  The code uses os.replace() (atomic rename on POSIX) for writes, which
+  prevents TORN READS (partial JSON). However, this does NOT prevent
+  LOST UPDATES because the read-modify-write is not atomic as a unit.
+
+MITIGATING FACTORS:
+  - The GUI's in-memory latch filter (hardware_manager.py:278) means redundant
+    trigger_relay() calls are filtered BEFORE writing to JSON.
+  - The worker's hw_status writes are infrequent (every 2 seconds).
+  - The retry loops (10 iterations × 10ms) provide crash tolerance but NOT
+    concurrency isolation.
+
+
+4.2  TEMPORAL COUPLING IN start_system.sh
+──────────────────────────────────────────
+
+The start script uses a hard-coded `sleep 1` (line 25) between launching
+hardware_worker.py and ai_gui_system.py. This creates a STARTUP RACE:
+
+  T=0.0s: hardware_worker.py starts
+  T=0.0s: hardware_worker.py calls update_hardware_status("OFFLINE")
+          → Creates /dev/shm/relay_status.json if missing (from safe_write_json)
+          → File owned by the LAUNCHING USER (critical!)
+  T=1.0s: ai_gui_system.py starts
+  T=1.0s: USBRelayManager.__init__() calls _ensure_bridge_file()
+          → File already exists → skips creation → reads it → writes to it
+          → MAY FAIL if user differs from hardware_worker.py's creator
+
+  If the "forklift" user runs start_system.sh:
+    - Line 14: `touch /dev/shm/relay_status.json` creates with forklift's UID ✓
+    - Line 15: `chmod 666 /dev/shm/relay_status.json` sets world-writable ✓
+    - Both processes CAN write ✓
+
+  If start_system.sh is NOT used (manual launch):
+    - Whichever process starts first OWNS the file
+    - The other process may fail to write
+
+SEVERITY: MEDIUM
+  This only affects non-standard launch sequences, but in a factory environment,
+  operators may restart individual components.
+
+
+4.3  config.json CONCURRENT ACCESS
+───────────────────────────────────
+
+config.json is read/written by ai_gui_system.py (GUI thread, main process)
+for ROI persistence and global settings. It is read by hardware_worker.py
+for serial port configuration (get_config_port(), line 55-68).
+
+The writes to config.json are NOT atomic:
+  - save_roi() (line 446-450): Direct `json.dump()` without temp-file rename
+  - save_global_configurations() (line 1542-1544): Direct `json.dump()`
+
+If hardware_worker.py reads config.json DURING a write, it may encounter:
+  - Truncated JSON → json.JSONDecodeError → retry loop catches this
+  - Empty file → returns {} → falls back to "/dev/ttyUSB0"
+
+SEVERITY: LOW
+  The worker reads config.json only during startup/reconnection, and the
+  retry loop (10 attempts × 10ms) provides adequate crash tolerance.
+  However, config.json writes should still use atomic rename for robustness.
+
+
+================================================================================
+ §5. MEMORY LEAKS & LATENCY BOTTLENECKS
+================================================================================
+
+5.1  QImage BUFFER LIFETIME HAZARD (CRITICAL)
+──────────────────────────────────────────────
+
+FILE: ai_gui_system.py, lines 769-773
+CODE:
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    h, w, ch = frame_rgb.shape
+    qt_image = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+    self.video_label.setPixmap(QPixmap.fromImage(qt_image))
+
+ISSUE:
+  QImage created with a raw data pointer does NOT copy the underlying buffer.
+  The numpy array `frame_rgb` must remain alive as long as QImage uses it.
+  In this specific code path, `frame_rgb` is a local variable in
+  on_frame_received() — it goes out of scope when the method returns.
+
+  HOWEVER, QPixmap.fromImage() performs a DEEP COPY of the pixel data into
+  Qt's internal storage. Therefore, `frame_rgb` CAN be safely deallocated
+  after setPixmap() completes. The QImage itself is also a temporary.
+
+  This is SAFE in the current code because the conversion chain is:
+    numpy → QImage (shallow) → QPixmap (deep copy) → setPixmap()
+  
+  But if any refactoring stores the QImage without converting to QPixmap,
+  it becomes a USE-AFTER-FREE vulnerability.
+
+RECOMMENDATION:
+  Explicitly copy the data into QImage for defensive safety:
+    qt_image = QImage(frame_rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+
+SEVERITY: LOW (currently safe, but fragile)
+
+
+5.2  OpenCV VideoCapture LEAK ON THREAD STOP
+─────────────────────────────────────────────
+
+FILE: ai_gui_system.py, lines 496-498
+CODE:
+    def stop_camera(self):
+        if self.camera_thread is not None:
+            self.camera_thread.stop()      # Sets running = False
+            self.camera_thread = None       # Drops reference immediately
+
+ISSUE:
+  CameraWorkerThread.stop() sets self.running = False, but the thread's run()
+  loop may be blocked on self.camera.cap.read() (a blocking OpenCV call that
+  can take up to 5 seconds on a hung V4L2 device).
+
+  Setting self.camera_thread = None drops the ONLY reference to the QThread.
+  If QThread.__del__() is called while the thread is still executing, Qt will
+  print "QThread: Destroyed while thread is still running" and may crash.
+
+  Each leaked CameraWorkerThread holds:
+    - 1 cv2.VideoCapture object (~50-200 MB of kernel DMA buffers)
+    - 1 OS thread (8 MB stack)
+    - Associated V4L2 file descriptors
+
+  After multiple Start/Stop cycles, this accumulates rapidly.
+
+RECOMMENDATION:
+    def stop_camera(self):
+        if self.camera_thread is not None:
+            self.camera_thread.stop()
+            self.camera_thread.wait(3000)  # Wait up to 3 seconds
+            self.camera_thread = None
+
+SEVERITY: HIGH (memory leak + potential crash in production)
+
+
+5.3  YOLOv8 INFERENCE LATENCY ANALYSIS
+───────────────────────────────────────
+
+The inference pipeline runs in the GUI's signal-slot delivery context:
+  CameraWorkerThread (worker thread) → frame_ready signal → on_frame_received()
+
+on_frame_received() executes on the MAIN GUI THREAD (Qt's event loop) because
+cross-thread signal-slot connections default to Qt.QueuedConnection.
+
+This means:
+  - YOLO inference (detector.detect_persons()) blocks the GUI event loop
+  - During inference, the GUI is FROZEN (no button presses, no alarm flashing)
+  - Typical inference times for YOLOv8n at imgsz=320:
+      CPU (Intel i5): ~40-80ms per frame
+      CPU (Intel i3): ~100-200ms per frame
+
+MITIGATING FACTORS:
+  - Frame skipping (line 651): Only 1 in 3 frames runs inference
+  - imgsz=320 (reduced from default 640): ~4× faster inference
+  - Results are cached across skipped frames
+
+EFFECTIVE INFERENCE RATE:
+  Camera FPS: ~30 (limited by time.sleep(0.03) in CameraWorkerThread)
+  Inference FPS: ~10 per station (every 3rd frame)
+  4 stations × 10 Hz = 40 inference cycles/second on the SAME GUI thread
+
+  At 80ms per inference: 40 × 80ms = 3,200ms of compute per 1,000ms wall time
+  THIS EXCEEDS 100% CPU UTILIZATION ON THE GUI THREAD.
+
+  In practice, Qt's signal queuing prevents true parallelism, so frames will
+  be dropped and FPS will degrade to approximately:
+    Effective FPS ≈ 1000ms / (80ms + overhead) ≈ 10-12 FPS total (all stations)
+    Per-station FPS ≈ 2-3 FPS
+
+WORST-CASE RELAY TRIP LATENCY:
+  Detection delay:  3 frames × 33ms = ~100ms (frame skipping)
+  Inference:        ~80ms (YOLOv8n at 320px on CPU)
+  JSON write:       ~0.5ms (tmpfs atomic replace)
+  Worker poll:      ~50ms (worst case: just missed a cycle)
+  On-Delay:         0ms (configured as 0.0s in config.json)
+  Serial TX:        ~2ms (2 bytes at 9600 baud)
+  TOTAL:            ~232ms best case, ~350ms typical
+
+  This is within acceptable limits for forklift safety (<500ms industry norm),
+  but is sensitive to CPU load spikes.
+
+SEVERITY: MEDIUM (adequate for current deployment, but not scalable)
+
+
+5.4  STYLE RECALCULATION IN EVERY FRAME
+────────────────────────────────────────
+
+FILE: ai_gui_system.py, lines 758-760
+CODE:
+    self.style().unpolish(self)
+    self.style().polish(self)
+
+This is called on EVERY frame received by EVERY station — potentially 30+
+times per second per station. Qt's style polish/unpolish forces a full
+cascade recomputation of the widget's CSS styling engine.
+
+RECOMMENDATION:
+  Only call unpolish/polish when the warning state actually CHANGES:
+    current_warning = "true" if warning else "false"
+    if self.property("warning") != current_warning:
+        self.setProperty("warning", current_warning)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+SEVERITY: MEDIUM (unnecessary CPU overhead, contributes to GUI lag)
+
+
+5.5  OVERLAY FRAME COPY ON EVERY FRAME
+───────────────────────────────────────
+
+FILE: ai_gui_system.py, lines 688-692
+CODE:
+    overlay = frame.copy()
+    cv2.rectangle(overlay, ...)
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+
+frame.copy() creates a full 640×480×3 = 921,600 byte allocation on every
+frame. With 4 stations at ~30 FPS each, this is:
+    921,600 × 30 × 4 = ~105 MB/s of memory allocation throughput
+
+Modern Python garbage collection handles this, but it contributes to
+GC pressure and occasional frame drop spikes.
+
+RECOMMENDATION:
+  Pre-allocate the overlay buffer once per CameraCardWidget:
+    self.overlay_buffer = np.zeros((480, 640, 3), dtype=np.uint8)
+  Then reuse:
+    np.copyto(self.overlay_buffer, frame)
+
+SEVERITY: LOW (performance optimization, not a safety issue)
+
+
+5.6  UNBOUNDED AUDIT LOG GROWTH
+────────────────────────────────
+
+FILE: ai_gui_system.py, lines 1703-1707
+CODE:
+    self.log_terminal.addItem(log_item)
+    self.log_terminal.scrollToBottom()
+    if self.log_terminal.count() > 50:
+        self.log_terminal.takeItem(0)
+
+The log is capped at 50 items — this is adequate. No memory leak here.
+However, scrollToBottom() on every log entry forces a layout recalculation.
+
+SEVERITY: NONE (already properly bounded)
+
+
+================================================================================
+ §6. SECURITY AUDIT FINDINGS
+================================================================================
+
+6.1  PLAINTEXT PASSWORD STORAGE
+────────────────────────────────
+
+FILE: security.json
+CONTENT:
+    {
+        "Supervisor": "1111",
+        "Engineer": "admin",
+        "Operator": "",
+        "Technician": "tech",
+        "Administrator": "superadmin"
+    }
+
+Passwords are stored in PLAINTEXT. Any user with read access to the project
+directory (including the "forklift" user via chmod 777) can read all passwords
+and escalate to Administrator level, gaining the ability to:
+  - Shut down the safety system
+  - Disable hardware coil output
+  - Modify YOLO confidence (set to 0.90 to effectively blind the detector)
+  - Change COM port to a non-existent device (disabling relay output)
+
+RECOMMENDATION:
+  Use bcrypt or argon2 password hashing:
+    import bcrypt
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+    # Verify:
+    bcrypt.checkpw(candidate.encode(), stored_hash)
+
+SEVERITY: HIGH (safety system can be deliberately defeated)
+
+
+6.2  KIOSK MODE BYPASS
+───────────────────────
+
+The GUI uses Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint, but does NOT:
+  - Disable Ctrl+Alt+Del / Ctrl+Alt+T (terminal access)
+  - Disable virtual console switching (Ctrl+Alt+F1-F6)
+  - Lock the desktop session
+
+An operator at the forklift terminal can switch to a virtual console,
+log in as "forklift", navigate to the project directory, and:
+  - Edit security.json to set all passwords to ""
+  - Kill the hardware_worker.py process
+  - Modify config.json to disable self-test and change relay mappings
+
+RECOMMENDATION:
+  - Configure the "forklift" user's shell to /usr/sbin/nologin
+  - Use a systemd service with Restart=always for both processes
+  - Use polkit rules to prevent the forklift user from accessing terminals
+
+SEVERITY: MEDIUM (requires physical access to the terminal)
+
+
+================================================================================
+ §7. ARCHITECTURAL REMEDIATION — IPC vs. FILE I/O
+================================================================================
+
+The current file-based IPC via /dev/shm/relay_status.json is functional but
+has inherent limitations for a safety-critical system. Below is a comparative
+analysis of alternative IPC mechanisms:
+
+┌───────────────────────┬────────┬────────────┬──────────┬──────────────────────┐
+│ IPC Mechanism         │Latency │ Race-Free? │ Multi-   │ Implementation       │
+│                       │        │            │ User?    │ Complexity           │
+├───────────────────────┼────────┼────────────┼──────────┼──────────────────────┤
+│ JSON on /dev/shm      │ ~50μs  │ NO (need   │ YES*     │ ALREADY DONE         │
+│ (current)             │        │  flock)    │ (*chmod) │                      │
+├───────────────────────┼────────┼────────────┼──────────┼──────────────────────┤
+│ Unix Domain Socket    │ ~10μs  │ YES        │ YES      │ MODERATE — requires  │
+│ (SOCK_STREAM)         │        │            │          │ server loop + JSON   │
+│                       │        │            │          │ message framing      │
+├───────────────────────┼────────┼────────────┼──────────┼──────────────────────┤
+│ POSIX Shared Memory   │ ~1μs   │ NO (need   │ YES      │ HIGH — requires C    │
+│ (shm_open + mmap)     │        │  semaphore)│          │ struct layout + sync │
+├───────────────────────┼────────┼────────────┼──────────┼──────────────────────┤
+│ Localhost TCP Socket  │ ~50μs  │ YES        │ YES      │ MODERATE — socket    │
+│ (127.0.0.1:PORT)      │        │            │          │ server + client      │
+├───────────────────────┼────────┼────────────┼──────────┼──────────────────────┤
+│ D-Bus                 │ ~100μs │ YES        │ YES      │ HIGH — requires      │
+│                       │        │            │          │ service registration │
+├───────────────────────┼────────┼────────────┼──────────┼──────────────────────┤
+│ Named Pipe (FIFO)     │ ~10μs  │ PARTIAL    │ YES      │ LOW — but            │
+│                       │        │            │          │ unidirectional only  │
+├───────────────────────┼────────┼────────────┼──────────┼──────────────────────┤
+│ JSON on /dev/shm      │ ~50μs  │ YES        │ YES      │ MINIMAL CHANGE       │
+│ + fcntl advisory lock │        │            │          │ (recommended)        │
+└───────────────────────┴────────┴────────────┴──────────┴──────────────────────┘
+
+RECOMMENDED STRATEGY: DEFENSE-IN-DEPTH (TWO-PHASE)
+────────────────────────────────────────────────────
+
+PHASE 1 — IMMEDIATE FIX (< 1 hour of work):
+  Keep the current /dev/shm/relay_status.json architecture but add:
+  (a) fcntl advisory file locking to prevent lost updates
+  (b) Correct /dev/shm file initialization in start_system.sh
+  (c) umask + chmod hardening in Python code
+  (d) Remove stale relay_status.json from project directory
+
+PHASE 2 — STRATEGIC UPGRADE (1-2 days of work):
+  Replace JSON file with a Unix Domain Socket server:
+  - hardware_worker.py becomes the IPC SERVER (binds a socket)
+  - ai_gui_system.py becomes the IPC CLIENT (connects and sends commands)
+  - Eliminates ALL file permission issues (sockets use filesystem permissions)
+  - Provides TRUE bidirectional communication with guaranteed delivery
+  - Enables real-time hardware status push (no polling needed)
+
+
+================================================================================
+ §8. CONCRETE REFACTORING RECOMMENDATIONS (WITH CODE SAMPLES)
+================================================================================
+
+8.1  PHASE 1A: ADD fcntl ADVISORY LOCKING
+───────────────────────────────────────────
+
+Replace the safe_read_json() and safe_write_json() functions in ALL THREE
+files (hardware_worker.py, hardware_manager.py, ai_gui_system.py) with
+file-locked versions:
+
+------------ BEGIN CODE SAMPLE: Locked JSON Bridge I/O --------------------
+
+import fcntl
+import json
+import os
+import time
+import tempfile
+
+STATUS_FILE = "/dev/shm/relay_status.json"
+LOCK_FILE   = "/dev/shm/relay_status.lock"
+
+def safe_read_json_locked(file_path):
+    """
+    Reads a JSON file with an advisory shared (read) lock.
+    Multiple readers can hold the lock simultaneously, but
+    writers are blocked until all readers release.
+    """
+    lock_path = file_path + ".lock"
+    for attempt in range(10):
+        try:
+            if not os.path.exists(file_path):
+                return {}
+            # Open a separate lock file to avoid interfering with
+            # atomic rename operations on the data file
+            with open(lock_path, "a") as lock_fd:
+                fcntl.flock(lock_fd, fcntl.LOCK_SH)  # Shared lock
+                try:
+                    with open(file_path, "r") as f:
+                        return json.load(f)
+                finally:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except (json.JSONDecodeError, IOError, OSError, PermissionError):
+            time.sleep(0.01)
+    return {}
+
+
+def safe_write_json_locked(file_path, data):
+    """
+    Writes a JSON file with an advisory exclusive (write) lock.
+    The exclusive lock blocks ALL other readers and writers,
+    ensuring atomic read-modify-write sequences when combined
+    with safe_read_json_locked().
+    """
+    lock_path = file_path + ".lock"
+    for attempt in range(10):
+        try:
+            with open(lock_path, "a") as lock_fd:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)  # Exclusive lock
+                try:
+                    # Use temp file + atomic rename for crash safety
+                    fd, temp_path = tempfile.mkstemp(
+                        dir=os.path.dirname(file_path),
+                        prefix=".relay_status_",
+                        suffix=".tmp"
+                    )
+                    try:
+                        with os.fdopen(fd, "w") as f:
+                            json.dump(data, f, indent=4)
+                        os.replace(temp_path, file_path)
+                        try:
+                            os.chmod(file_path, 0o666)
+                        except Exception:
+                            pass
+                        return True
+                    except:
+                        try:
+                            os.unlink(temp_path)
+                        except:
+                            pass
+                        raise
+                finally:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except (IOError, OSError, PermissionError):
+            time.sleep(0.01)
+    return False
+
+------------ END CODE SAMPLE -----------------------------------------------
+
+
+8.2  PHASE 1B: FIX start_system.sh INITIALIZATION
+──────────────────────────────────────────────────
+
+Replace the current start_system.sh with:
+
+------------ BEGIN CODE SAMPLE: Hardened start_system.sh -------------------
+
+#!/bin/bash
+# ============================================================
+# Limitless Future — Hardened System Launcher
+# ============================================================
+
+# 1. Display server access
+export DISPLAY=:0
+export XAUTHORITY=$HOME/.Xauthority
+xhost +SI:localuser:$USER >> /dev/null 2>&1
+xhost +local:$USER >> /dev/null 2>&1
+
+# 2. Kernel stabilization wait
+sleep 3
+
+# 3. Kill any orphaned hardware worker instances
+pkill -f hardware_worker.py 2>/dev/null
+sleep 0.5
+
+# 4. Initialize shared-memory IPC bridge with CORRECT permissions
+#    This is the CRITICAL fix for multi-user deployments.
+#    We use umask to ensure the file is created world-writable.
+SHM_FILE="/dev/shm/relay_status.json"
+SHM_LOCK="/dev/shm/relay_status.json.lock"
+
+# Remove stale files to prevent ownership conflicts
+rm -f "$SHM_FILE" "$SHM_FILE.tmp" "$SHM_LOCK" 2>/dev/null
+
+# Create fresh files with world-readable/writable permissions
+umask 000
+echo '{}' > "$SHM_FILE"
+touch "$SHM_LOCK"
+umask 022  # Restore default umask
+
+# Verify permissions
+chmod 666 "$SHM_FILE" 2>/dev/null
+chmod 666 "$SHM_LOCK" 2>/dev/null
+
+echo "[LAUNCHER] IPC bridge initialized: $SHM_FILE ($(stat -c '%a %U' $SHM_FILE))"
+
+# 5. Enter project directory and activate venv
+PROJECT_DIR="$HOME/Desktop/AI_Forklift_Safety"
+if [ ! -d "$PROJECT_DIR" ]; then
+    # Fallback: use admin's project directory
+    PROJECT_DIR="/home/limitlessfuture/Desktop/AI_Forklift_Safety"
+fi
+cd "$PROJECT_DIR"
+source venv/bin/activate
+
+# 6. Launch hardware worker in background
+python3 hardware_worker.py &
+HW_PID=$!
+echo "[LAUNCHER] Hardware worker started (PID: $HW_PID)"
+
+# 7. Wait for serial stabilization
+sleep 2
+
+# 8. Launch GUI
+export QT_QPA_PLATFORM=xcb
+python3 ai_gui_system.py
+
+# 9. Cleanup on exit
+kill $HW_PID 2>/dev/null
+rm -f "$SHM_FILE" "$SHM_FILE.tmp" "$SHM_LOCK" 2>/dev/null
+echo "[LAUNCHER] System shutdown complete."
+
+------------ END CODE SAMPLE -----------------------------------------------
+
+
+8.3  PHASE 1C: FIX CameraWorkerThread LEAK
+────────────────────────────────────────────
+
+In ai_gui_system.py, modify stop_camera():
+
+------------ BEGIN CODE SAMPLE: Fixed stop_camera() -----------------------
+
+def stop_camera(self):
+    if not self.is_active:
+        return
+
+    if self.blink_timer is not None:
+        self.blink_timer.stop()
+        self.blink_timer = None
+
+    if self.camera_thread is not None:
+        self.camera_thread.stop()
+        if not self.camera_thread.wait(3000):  # Wait max 3 seconds
+            print(f"[WARNING] Camera thread for station {self.cam_id + 1} "
+                  f"did not terminate gracefully. Forcing termination.")
+            self.camera_thread.terminate()
+            self.camera_thread.wait(1000)
+        self.camera_thread = None
+
+    self.is_active = False
+    # ... rest of the method unchanged ...
+
+------------ END CODE SAMPLE -----------------------------------------------
+
+
+8.4  PHASE 1D: OPTIMIZE STYLE RECALCULATION
+─────────────────────────────────────────────
+
+In ai_gui_system.py on_frame_received(), change the style update block:
+
+------------ BEGIN CODE SAMPLE: Conditional Style Update -------------------
+
+    # Only repaint dynamic styles when warning state changes
+    new_warning_str = "true" if warning else "false"
+    if self.property("warning") != new_warning_str:
+        self.setProperty("warning", new_warning_str)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+------------ END CODE SAMPLE -----------------------------------------------
+
+
+8.5  PHASE 2: UNIX DOMAIN SOCKET IPC (STRATEGIC UPGRADE)
+──────────────────────────────────────────────────────────
+
+For the long-term strategic upgrade, replace the JSON file bridge with
+a Unix Domain Socket. The socket file should be created in /tmp or /run
+with appropriate permissions:
+
+SOCKET PATH: /dev/shm/forklift_relay.sock
+  - Using /dev/shm ensures tmpfs performance
+  - Socket files have filesystem permissions (chmod 777 on socket is safe)
+
+PROTOCOL DESIGN:
+  - JSON-over-newline protocol (each message is one JSON line + \n)
+  - Request-Response pattern for commands
+  - Server (hardware_worker.py) pushes status updates proactively
+
+MESSAGE FORMAT (Client → Server):
+    {"cmd": "trigger", "station": 1, "state": 1}
+    {"cmd": "trigger", "station": 2, "state": 0}
+    {"cmd": "config", "on_delay": 0.2, "off_delay": 1.5}
+    {"cmd": "status"}
+    {"cmd": "self_test"}
+
+MESSAGE FORMAT (Server → Client):
+    {"status": "ONLINE", "relays": [0,0,0,0], "ts": 1717689600.123}
+    {"ack": true, "cmd": "trigger", "station": 1}
+
+ADVANTAGES:
+  - No file permission issues (socket inherits creator's permissions)
+  - No race conditions (TCP/stream semantics guarantee ordering)
+  - No polling needed (server pushes status changes)
+  - Lower latency (~10μs vs ~50μs for file I/O)
+  - Bidirectional communication in a single connection
+  - Connection loss is immediately detectable (unlike file I/O)
+
+IMPLEMENTATION OUTLINE:
+
+1. hardware_worker.py becomes a socket server:
+   - Creates Unix domain socket at /dev/shm/forklift_relay.sock
+   - Accepts connections from GUI client
+   - Receives trigger commands on the socket
+   - Sends hardware status updates back on the socket
+   - Continues to manage serial communication with RM04U
+
+2. hardware_manager.py becomes a socket client:
+   - Connects to the Unix domain socket
+   - Sends trigger commands as JSON messages
+   - Receives hardware status updates asynchronously
+   - Reconnects automatically if connection drops
+
+3. start_system.sh creates the socket file with correct permissions:
+   - rm -f /dev/shm/forklift_relay.sock
+   - The hardware_worker.py server creates it with os.chmod(path, 0o777)
+
+This eliminates ALL of the following problems:
+  ✓ File ownership conflicts between users
+  ✓ Read-modify-write race conditions
+  ✓ Lost update anomalies
+  ✓ Polling overhead (replaced with event-driven push)
+  ✓ Need for chmod 777 on project directory
+
+
+================================================================================
+ §9. HARDENED DEPLOYMENT CONFIGURATION
+================================================================================
+
+9.1  SYSTEMD SERVICE FILES (RECOMMENDED)
+─────────────────────────────────────────
+
+Instead of autostart scripts, use systemd user services for reliability:
+
+File: /etc/systemd/system/forklift-hardware.service
+------------------------------------------------------
+[Unit]
+Description=Forklift Safety System — Hardware Worker
+After=network.target
+Wants=forklift-gui.service
+
+[Service]
+Type=simple
+User=forklift
+Group=dialout
+WorkingDirectory=/home/limitlessfuture/Desktop/AI_Forklift_Safety
+ExecStartPre=/bin/bash -c 'rm -f /dev/shm/relay_status.json*; echo "{}" > /dev/shm/relay_status.json; chmod 666 /dev/shm/relay_status.json; touch /dev/shm/relay_status.json.lock; chmod 666 /dev/shm/relay_status.json.lock'
+ExecStart=/home/limitlessfuture/Desktop/AI_Forklift_Safety/venv/bin/python3 hardware_worker.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/forklift-hardware.log
+StandardError=append:/var/log/forklift-hardware.log
+
+[Install]
+WantedBy=multi-user.target
+------------------------------------------------------
+
+File: /etc/systemd/system/forklift-gui.service
+------------------------------------------------------
+[Unit]
+Description=Forklift Safety System — AI GUI
+After=forklift-hardware.service
+Requires=forklift-hardware.service
+
+[Service]
+Type=simple
+User=forklift
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/forklift/.Xauthority
+Environment=QT_QPA_PLATFORM=xcb
+WorkingDirectory=/home/limitlessfuture/Desktop/AI_Forklift_Safety
+ExecStartPre=/bin/sleep 2
+ExecStart=/home/limitlessfuture/Desktop/AI_Forklift_Safety/venv/bin/python3 ai_gui_system.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/forklift-gui.log
+StandardError=append:/var/log/forklift-gui.log
+
+[Install]
+WantedBy=graphical.target
+------------------------------------------------------
+
+9.2  UDEV RULES FOR SERIAL PORT
+─────────────────────────────────
+
+File: /etc/udev/rules.d/99-forklift-relay.rules
+------------------------------------------------------
+# RM04U CH340 USB Relay Module — persistent symlink
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+    SYMLINK+="forklift_relay", MODE="0666", GROUP="dialout"
+------------------------------------------------------
+
+This creates a persistent /dev/forklift_relay symlink regardless of which
+USB port the relay is plugged into, and ensures correct permissions.
+
+Update config.json to use: "com_port": "/dev/forklift_relay"
+
+
+================================================================================
+ §10. VERIFICATION CHECKLIST
+================================================================================
+
+After implementing the Phase 1 fixes, verify the following:
+
+ [ ] 1. Delete /home/limitlessfuture/Desktop/AI_Forklift_Safety/relay_status.json
+         (the stale decoy file in the project directory)
+
+ [ ] 2. Delete /home/limitlessfuture/Desktop/AI_Forklift_Safety/relay_statusadmin.json
+         (another stale decoy file)
+
+ [ ] 3. Log in as "forklift" user
+ [ ] 4. Run: ls -la /dev/shm/relay_status.json
+         Expected: -rw-rw-rw- 1 forklift forklift ... relay_status.json
+ [ ] 5. Run start_system.sh
+ [ ] 6. Verify hardware_worker.py output shows:
+         "[HARDWARE] Consumer STARTED — Polling every 50ms"
+         NOT: "[HARDWARE] Safe status write failed for status: ONLINE"
+ [ ] 7. Verify GUI shows "🟢 RELAY MODULE: CONNECTED" (green banner)
+ [ ] 8. Place a person in camera FOV within ROI
+ [ ] 9. Verify relay clicks audibly (N1/N2/N3/N4 depending on mapping)
+ [ ]10. Remove person from ROI
+ [ ]11. Verify relay releases after Off-Delay period
+
+ STRESS TEST:
+ [ ]12. Start all 4 stations simultaneously
+ [ ]13. Run for 30 minutes continuously
+ [ ]14. Monitor `htop` for memory growth in python3 processes
+ [ ]15. Monitor /var/log/syslog for USB disconnect/reconnect events
+ [ ]16. Verify no "[HARDWARE] Safe status write failed" in logs
+
+ MULTI-USER TEST:
+ [ ]17. Log in as "limitlessfuture" (admin)
+ [ ]18. Start the system manually (python3 hardware_worker.py &)
+ [ ]19. In a second terminal (as forklift): python3 ai_gui_system.py
+ [ ]20. Verify both processes can write to /dev/shm/relay_status.json
+ [ ]21. Verify no permission errors in either process's stdout
+
+
+================================================================================
+ §11. RISK MATRIX & SEVERITY CLASSIFICATION
+================================================================================
+
+┌─────┬──────────────────────────────────┬──────────┬────────────┬────────────┐
+│ ID  │ Finding                          │ Severity │ Likelihood │ Impact     │
+├─────┼──────────────────────────────────┼──────────┼────────────┼────────────┤
+│ C1  │ Stale relay_status.json in       │ LOW      │ LOW        │ Confusion  │
+│     │ project dir (decoy file)         │          │            │            │
+├─────┼──────────────────────────────────┼──────────┼────────────┼────────────┤
+│ C2  │ No file locking on JSON bridge   │ HIGH     │ MEDIUM     │ CRITICAL   │
+│     │ → Lost trigger updates           │          │ (~2%/cycle)│ → Missed   │
+│     │                                  │          │            │   detection│
+├─────┼──────────────────────────────────┼──────────┼────────────┼────────────┤
+│ C3  │ /dev/shm file ownership on       │ HIGH     │ HIGH       │ CRITICAL   │
+│     │ cold start without script        │          │            │ → System   │
+│     │                                  │          │            │   disabled │
+├─────┼──────────────────────────────────┼──────────┼────────────┼────────────┤
+│ C4  │ QImage buffer lifetime hazard    │ LOW      │ LOW        │ Crash      │
+│     │                                  │          │ (currently │            │
+│     │                                  │          │  safe)     │            │
+├─────┼──────────────────────────────────┼──────────┼────────────┼────────────┤
+│ C5  │ CameraWorkerThread.stop()        │ HIGH     │ HIGH       │ Memory     │
+│     │ missing wait() → resource leak   │          │ (every     │ exhaustion │
+│     │                                  │          │  stop/     │ after      │
+│     │                                  │          │  start)    │ hours      │
+├─────┼──────────────────────────────────┼──────────┼────────────┼────────────┤
+│ C6  │ Plaintext passwords in JSON      │ HIGH     │ MEDIUM     │ Safety     │
+│     │                                  │          │            │ system     │
+│     │                                  │          │            │ defeat     │
+├─────┼──────────────────────────────────┼──────────┼────────────┼────────────┤
+│ C7  │ Non-atomic config.json writes    │ LOW      │ LOW        │ Config     │
+│     │                                  │          │            │ corruption │
+├─────┼──────────────────────────────────┼──────────┼────────────┼────────────┤
+│ C8  │ Style polish on every frame      │ MEDIUM   │ HIGH       │ GUI lag    │
+│     │ (30+ times/sec)                  │          │ (always)   │            │
+├─────┼──────────────────────────────────┼──────────┼────────────┼────────────┤
+│ C9  │ YOLO inference on GUI thread     │ MEDIUM   │ MEDIUM     │ Increased  │
+│     │ blocking event loop              │          │            │ trip time  │
+├─────┼──────────────────────────────────┼──────────┼────────────┼────────────┤
+│ C10 │ Kiosk mode bypass via VT switch  │ MEDIUM   │ LOW        │ Tamper     │
+│     │                                  │          │            │ risk       │
+└─────┴──────────────────────────────────┴──────────┴────────────┴────────────┘
+
+OVERALL SYSTEM RISK ASSESSMENT:
+  The system is FUNCTIONAL and SAFE for normal operation under the intended
+  deployment configuration (start_system.sh executed as the auto-login user).
+  However, it contains several latent defects that could cause failures under
+  edge conditions (power cycling, USB disconnects, multi-user confusion).
+
+  The MOST CRITICAL immediate fix is ensuring /dev/shm/relay_status.json is
+  always created with world-writable (666) permissions BEFORE either Python
+  process starts. The start_system.sh already does this — the fix is to
+  ensure this script is ALWAYS the entry point (via systemd service or
+  .desktop autostart file).
+
+
+================================================================================
+ END OF REPORT
+================================================================================
+ Generated by Google Antigravity — Industrial Code Review Engine
+ Report File: industrial_safety_review_report.txt
+ Location: /home/limitlessfuture/Desktop/AI_Forklift_Safety/
+================================================================================

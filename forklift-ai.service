@@ -1,0 +1,29 @@
+[Unit]
+Description=Limitless Future — AI Forklift Safety System Production Service
+After=network.target graphical.target systemd-udevd.service
+Wants=graphical.target
+
+[Service]
+Type=simple
+User=forklift
+WorkingDirectory=/home/forklift/Desktop/AI_Forklift_Safety
+Environment="DISPLAY=:0"
+Environment="XAUTHORITY=/home/forklift/.Xauthority"
+Environment="QT_QPA_PLATFORM=xcb"
+
+# Pre-execution auto-healing: clean stale IPC sockets, lock files, and orphan workers
+ExecStartPre=/bin/sh -c 'rm -f /dev/shm/forklift_relay.sock /dev/shm/*.sock /tmp/hardware_worker.lock /tmp/*.lock 2>/dev/null || true'
+ExecStartPre=/bin/sh -c 'pkill -f hardware_worker.py 2>/dev/null || true'
+ExecStartPre=/bin/sleep 2
+
+# Main service launcher
+ExecStart=/bin/bash /home/forklift/Desktop/AI_Forklift_Safety/start_system.sh
+
+# Auto-Healing & Resilience
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical.target

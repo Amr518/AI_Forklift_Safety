@@ -1,0 +1,92 @@
+{
+    "camera_0": {
+        "norm_x": 0.1,
+        "norm_y": 0.1,
+        "norm_w": 0.5,
+        "norm_h": 0.5,
+        "x": 45,
+        "y": 35,
+        "w": 225,
+        "h": 175,
+        "physical_usb_path": "1-1"
+    },
+    "camera_1": {
+        "norm_x": 0.0658,
+        "norm_y": 0.2343,
+        "norm_w": 0.8816,
+        "norm_h": 0.7486,
+        "x": 25,
+        "y": 82,
+        "w": 335,
+        "h": 262,
+        "physical_usb_path": "1-1"
+    },
+    "camera_2": {
+        "norm_x": 0.0632,
+        "norm_y": 0.1943,
+        "norm_w": 0.8921,
+        "norm_h": 0.7,
+        "x": 24,
+        "y": 68,
+        "w": 347,
+        "h": 245
+    },
+    "camera_3": {
+        "norm_x": 0.05,
+        "norm_y": 0.16,
+        "norm_w": 0.9,
+        "norm_h": 0.7314,
+        "x": 19,
+        "y": 56,
+        "w": 355,
+        "h": 256,
+        "physical_usb_path": "1-7"
+    },
+    "settings": {
+        "com_port": "/dev/ttyUSB0",
+        "baud_rate": 9600,
+        "camera_mapping": [
+            0,
+            2,
+            4,
+            6
+        ],
+        "camera_physical_paths": [
+            "1-1",
+            "1-1",
+            null,
+            "1-7"
+        ],
+        "relay_mapping": [
+            1,
+            1,
+            1,
+            0
+        ],
+        "model_path": "yolov8n.pt",
+        "confidence": 0.32,
+        "on_delay": 0.2,
+        "off_delay": 10.0,
+        "boot_self_test": 1,
+        "hardware_coil_enabled": 1,
+        "alarm_auto_reset": 20.0,
+        "relay_mapping_b": [
+            1,
+            0,
+            4,
+            3
+        ],
+        "relay_a_active": [
+            true,
+            true,
+            true,
+            true
+        ],
+        "relay_b_active": [
+            false,
+            false,
+            false,
+            false
+        ]
+    }
+}

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=AI Forklift Safety
+Comment=Launch Forklift Safety System under Systemd
+Exec=/usr/bin/systemctl --user restart forklift-ai.service
+Icon=utilities-terminal
+Terminal=false
+StartupNotify=true
+Categories=Industrial;AI;

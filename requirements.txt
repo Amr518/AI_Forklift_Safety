@@ -1,0 +1,24 @@
+# Core GUI & Industrial HMI Framework
+PyQt5>=5.15.10
+PyQt5-Qt5>=5.15.2
+PyQt5_sip>=12.13.0
+
+# Deep Learning & Computer Vision
+ultralytics>=8.1.0
+torch>=2.1.0
+torchvision>=0.16.0
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+PyYAML>=6.0.1
+
+# Serial Communication & Hardware I/O
+pyserial>=3.5
+
+# System Monitoring & Resource Management
+psutil>=5.9.0
+
+# Mathematical & Scientific Utilities
+scipy>=1.11.0
+requests>=2.31.0
+typing_extensions>=4.8.0
