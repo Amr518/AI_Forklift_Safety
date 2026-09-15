@@ -127,6 +127,9 @@ def load_initial_config():
         "boot_self_test":        1,
         "hardware_coil_enabled": 1,
         "relay_mapping":         [1, 2, 3, 4],
+        "relay_mapping_2":       [None, None, None, None],
+        "relay_enable_1":        [True, True, True, True],
+        "relay_enable_2":        [False, False, False, False],
     }
     try:
         if os.path.exists(config_path):
@@ -138,6 +141,12 @@ def load_initial_config():
                     defaults[key] = settings[key]
             if "relay_mapping" in settings:
                 defaults["relay_mapping"] = settings["relay_mapping"]
+            if "relay_mapping_2" in settings:
+                defaults["relay_mapping_2"] = settings["relay_mapping_2"]
+            if "relay_enable_1" in settings:
+                defaults["relay_enable_1"] = settings["relay_enable_1"]
+            if "relay_enable_2" in settings:
+                defaults["relay_enable_2"] = settings["relay_enable_2"]
     except Exception as e:
         print(f"[HARDWARE] Warning: Could not read config.json: {e}")
     return defaults
@@ -151,8 +160,17 @@ class SharedState:
         self._lock  = threading.Lock()
         config      = load_initial_config()
         mapping     = config.get("relay_mapping", [1, 2, 3, 4])
+        mapping_2   = config.get("relay_mapping_2", [None, None, None, None])
+        enable_1    = config.get("relay_enable_1", [True, True, True, True])
+        enable_2    = config.get("relay_enable_2", [False, False, False, False])
         while len(mapping) < 4:
             mapping.append(len(mapping) + 1)
+        while len(mapping_2) < 4:
+            mapping_2.append(None)
+        while len(enable_1) < 4:
+            enable_1.append(True)
+        while len(enable_2) < 4:
+            enable_2.append(False)
 
         self._data = {
             "station_1_trigger":     0,
@@ -163,6 +181,18 @@ class SharedState:
             "station_2_relay":       mapping[1],
             "station_3_relay":       mapping[2],
             "station_4_relay":       mapping[3],
+            "station_1_relay_2":     mapping_2[0],
+            "station_2_relay_2":     mapping_2[1],
+            "station_3_relay_2":     mapping_2[2],
+            "station_4_relay_2":     mapping_2[3],
+            "station_1_enable_1":    enable_1[0],
+            "station_2_enable_1":    enable_1[1],
+            "station_3_enable_1":    enable_1[2],
+            "station_4_enable_1":    enable_1[3],
+            "station_1_enable_2":    enable_2[0],
+            "station_2_enable_2":    enable_2[1],
+            "station_3_enable_2":    enable_2[2],
+            "station_4_enable_2":    enable_2[3],
             "manual_test":           0,
             "boot_self_test":        config.get("boot_self_test", 1),
             "hardware_coil_enabled": config.get("hardware_coil_enabled", 1),
@@ -313,10 +343,20 @@ class IPCServer:
 
         elif cmd == "relay_mapping":
             mapping = msg.get("mapping", [1, 2, 3, 4])
-            updates = {
-                f"station_{i + 1}_relay": int(mapping[i])
-                for i in range(min(4, len(mapping)))
-            }
+            mapping_2 = msg.get("mapping_2", [None, None, None, None])
+            enable_1 = msg.get("enable_1", [True, True, True, True])
+            enable_2 = msg.get("enable_2", [False, False, False, False])
+            
+            updates = {}
+            for i in range(min(4, len(mapping))):
+                updates[f"station_{i + 1}_relay"] = int(mapping[i]) if mapping[i] is not None else None
+            for i in range(min(4, len(mapping_2))):
+                updates[f"station_{i + 1}_relay_2"] = int(mapping_2[i]) if mapping_2[i] is not None else None
+            for i in range(min(4, len(enable_1))):
+                updates[f"station_{i + 1}_enable_1"] = bool(enable_1[i])
+            for i in range(min(4, len(enable_2))):
+                updates[f"station_{i + 1}_enable_2"] = bool(enable_2[i])
+                
             if updates:
                 self.state.update(updates)
             self._send_ack(client_sock, cmd, True)
@@ -333,10 +373,20 @@ class IPCServer:
             }
             if "relay_mapping" in msg:
                 mapping = msg["relay_mapping"]
-                updates.update({
-                    f"station_{i + 1}_relay": int(mapping[i])
-                    for i in range(min(4, len(mapping)))
-                })
+                for i in range(min(4, len(mapping))):
+                    updates[f"station_{i + 1}_relay"] = int(mapping[i]) if mapping[i] is not None else None
+            if "relay_mapping_2" in msg:
+                mapping_2 = msg["relay_mapping_2"]
+                for i in range(min(4, len(mapping_2))):
+                    updates[f"station_{i + 1}_relay_2"] = int(mapping_2[i]) if mapping_2[i] is not None else None
+            if "relay_enable_1" in msg:
+                enable_1 = msg["relay_enable_1"]
+                for i in range(min(4, len(enable_1))):
+                    updates[f"station_{i + 1}_enable_1"] = bool(enable_1[i])
+            if "relay_enable_2" in msg:
+                enable_2 = msg["relay_enable_2"]
+                for i in range(min(4, len(enable_2))):
+                    updates[f"station_{i + 1}_enable_2"] = bool(enable_2[i])
             if updates:
                 self.state.update(updates)
             self._send_ack(client_sock, cmd, True)
@@ -573,15 +623,29 @@ class HardwareWorker:
                 # --- Phase 2: OR-reduce station states onto physical relay targets ---
                 # Relay target = 1  if ANY station mapped to that relay has state == 1
                 # Relay target = 0  ONLY when ALL mapped stations have state == 0
-                # This block is completely unchanged from the original logic.
                 targets = {1: 0, 2: 0, 3: 0, 4: 0}
                 if coil_enabled or is_manual:
                     for relay_ch in range(1, 5):
                         for station in range(1, 5):
-                            mapped_relay = int(config.get(f"station_{station}_relay", station))
-                            if mapped_relay == relay_ch and station_states[station] == 1:
-                                targets[relay_ch] = 1
-                                break  # OR satisfied — no need to check remaining stations
+                            if station_states[station] == 1:
+                                mapped_relay = config.get(f"station_{station}_relay", station)
+                                mapped_relay_2 = config.get(f"station_{station}_relay_2", None)
+                                enable_1 = config.get(f"station_{station}_enable_1", True)
+                                enable_2 = config.get(f"station_{station}_enable_2", False)
+                                
+                                try:
+                                    m1 = int(mapped_relay) if mapped_relay is not None else None
+                                except (ValueError, TypeError):
+                                    m1 = None
+                                    
+                                try:
+                                    m2 = int(mapped_relay_2) if mapped_relay_2 is not None else None
+                                except (ValueError, TypeError):
+                                    m2 = None
+                                    
+                                if (enable_1 and m1 == relay_ch) or (enable_2 and m2 == relay_ch):
+                                    targets[relay_ch] = 1
+                                    break  # OR satisfied — no need to check remaining stations
 
                 # --- Phase 3: Edge-triggered output + heartbeat retransmission ---
                 #

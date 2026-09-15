@@ -78,6 +78,11 @@ echo "[LAUNCHER] Socket ready. Launching GUI..."
 
 # 8. Launch the AI GUI (Socket IPC Client) in fullscreen kiosk mode
 export QT_QPA_PLATFORM=xcb
+unset QT_PLUGIN_PATH
+PYQT5_PLUGINS="$(python3 -c 'from PyQt5.QtCore import QLibraryInfo; print(QLibraryInfo.location(QLibraryInfo.PluginsPath))' 2>/dev/null)"
+if [ -n "$PYQT5_PLUGINS" ]; then
+    export QT_QPA_PLATFORM_PLUGIN_PATH="$PYQT5_PLUGINS/platforms"
+fi
 python3 ai_gui_system.py
 EXIT_CODE=$?
 

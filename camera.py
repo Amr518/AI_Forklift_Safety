@@ -17,10 +17,16 @@ class Camera:
 
     def initialize_camera(self):
         try:
-            self.cap = cv2.VideoCapture(self.device_index)
-            if self.cap is not None:
+            import platform
+            if platform.system() == 'Linux':
+                self.cap = cv2.VideoCapture(self.device_index, cv2.CAP_V4L2)
+            else:
+                self.cap = cv2.VideoCapture(self.device_index)
+            if self.cap is not None and self.cap.isOpened():
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            else:
+                self.cap = None
         except Exception:
             self.cap = None
 

@@ -354,19 +354,32 @@ class USBRelayManager:
     # DYNAMIC RELAY MAPPING
     # ==========================================
 
-    def update_relay_mapping(self, mapping_list):
+    def update_relay_mapping(self, mapping_list, mapping_2=None, enable_1=None, enable_2=None):
         """
         Updates the station-to-relay mapping via socket.
 
         Args:
             mapping_list: list of ints [relay_for_st1, relay_for_st2,
                                         relay_for_st3, relay_for_st4]
+            mapping_2: optional second relay mapping per station
+            enable_1: optional boolean list for enabling relay 1
+            enable_2: optional boolean list for enabling relay 2
         """
+        if mapping_2 is None:
+            mapping_2 = [None, None, None, None]
+        if enable_1 is None:
+            enable_1 = [True, True, True, True]
+        if enable_2 is None:
+            enable_2 = [False, False, False, False]
+
         self._send_command({
-            "cmd":     "relay_mapping",
-            "mapping": [int(m) for m in mapping_list],
+            "cmd":       "relay_mapping",
+            "mapping":   [(int(m) if m is not None else None) for m in mapping_list],
+            "mapping_2": [(int(m) if m is not None else None) for m in mapping_2],
+            "enable_1":  [bool(m) for m in enable_1],
+            "enable_2":  [bool(m) for m in enable_2],
         })
-        print(f"[USBRelayManager] Relay mapping updated: {mapping_list}")
+        print(f"[USBRelayManager] Relay mapping updated: st1={mapping_list[0]}/{mapping_2[0]}, st2={mapping_list[1]}/{mapping_2[1]}, st3={mapping_list[2]}/{mapping_2[2]}, st4={mapping_list[3]}/{mapping_2[3]}")
 
     # ==========================================
     # LIFECYCLE CLEANUP

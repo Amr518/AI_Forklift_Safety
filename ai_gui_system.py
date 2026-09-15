@@ -90,7 +90,27 @@ from roi import VideoLabel
 from hardware_manager import USBRelayManager
 
 # Touch Authentication Dialog
-from osk_widget import TouchPasswordDialog
+from osk_widget import TouchPasswordDialog, OSKWidget
+
+# Modular Health & Diagnostics
+try:
+    from health_diagnostics import MetricsEngine, HealthDiagnosticsPage
+    _HEALTH_MODULE_AVAILABLE = True
+except Exception as _hd_err:
+    _HEALTH_MODULE_AVAILABLE = False
+    print(f"[Health] Module not available: {_hd_err}")
+
+# Modular Reporting & Email
+try:
+    from report_manager import ReportManager
+    from email_manager import EmailConfig, EmailWorker, EmailScheduler
+    from storage_manager import StorageManager, StorageWorker
+    from reporting_page import ReportsEmailPage
+    _REPORTING_MODULE_AVAILABLE = True
+except Exception as _rep_err:
+    _REPORTING_MODULE_AVAILABLE = False
+    print(f"[Reporting] Module not available: {_rep_err}")
+
 
 
 
@@ -2361,15 +2381,41 @@ class ForkliftSafetyGUI(QWidget):
                 height: 0px;
             }
         """)
-        self.health_page = self.build_health_diagnostics_page()
-        self.health_scroll.setWidget(self.health_page)
-        self.stacked_widget.addWidget(self.health_scroll)
+        # ---------------------------------------------
+        # PAGE 2: HEALTH & DIAGNOSTICS (MODULAR)
+        # ---------------------------------------------
+        if _HEALTH_MODULE_AVAILABLE:
+            self.metrics_engine = MetricsEngine(gui_ref=self)
+            self.metrics_engine.start()
+            self.health_page = HealthDiagnosticsPage(self.metrics_engine)
+            self.health_scroll.setWidget(self.health_page)
+            self.stacked_widget.addWidget(self.health_scroll)
+
+            self.health_refresh_timer = QTimer(self)
+            self.health_refresh_timer.setInterval(1000)
+            self.health_refresh_timer.timeout.connect(self.health_page.refresh_ui)
+        else:
+            self.health_page = self.build_health_diagnostics_page()
+            self.health_scroll.setWidget(self.health_page)
+            self.stacked_widget.addWidget(self.health_scroll)
 
         # ---------------------------------------------
-        # PAGE 3: REPORTS & EMAIL
+        # PAGE 3: REPORTS & EMAIL (MODULAR)
         # ---------------------------------------------
-        self.reports_page = self.build_reports_email_page()
-        self.stacked_widget.addWidget(self.reports_page)
+        if _REPORTING_MODULE_AVAILABLE:
+            self.report_manager = ReportManager()
+            self.email_scheduler = EmailScheduler(config=None, gui_ref=self)
+            self.reports_page = ReportsEmailPage(
+                gui_ref=self,
+                report_manager=self.report_manager,
+                email_scheduler=self.email_scheduler
+            )
+            self.stacked_widget.addWidget(self.reports_page)
+            self.email_scheduler.trigger_report_email.connect(self.reports_page.send_scheduled_email)
+            self.email_scheduler.start()
+        else:
+            self.reports_page = self.build_reports_email_page()
+            self.stacked_widget.addWidget(self.reports_page)
 
         middle_layout.addWidget(self.stacked_widget, stretch=1)
 
@@ -2841,9 +2887,18 @@ class ForkliftSafetyGUI(QWidget):
     def show_health_page(self):
         self.stacked_widget.setCurrentIndex(2)
         self._update_nav_styles(2)
-        self.update_health_diagnostics()
+        if hasattr(self, 'health_refresh_timer'):
+            self.health_refresh_timer.start()
+        if hasattr(self, 'health_page') and hasattr(self.health_page, 'refresh_ui'):
+            self.health_page.refresh_ui()
+        elif hasattr(self, 'update_health_diagnostics'):
+            self.update_health_diagnostics()
 
     def show_reports_page(self):
+        role_level = self.access_levels.get(self.current_role, 1)
+        if role_level < 3:
+            QMessageBox.warning(self, "Access Denied", "Reports & Email panel requires Supervisor or higher privileges.")
+            return
         self.stacked_widget.setCurrentIndex(3)
         self._update_nav_styles(3)
 
@@ -3846,7 +3901,10 @@ class ForkliftSafetyGUI(QWidget):
             self.global_settings["boot_self_test"] == 1
         )
         self.relay_manager.update_relay_mapping(
-            self.global_settings["relay_mapping"]
+            self.global_settings["relay_mapping"],
+            mapping_2=self.global_settings.get("relay_mapping_b"),
+            enable_1=self.global_settings.get("relay_a_active"),
+            enable_2=self.global_settings.get("relay_b_active")
         )
         self.relay_manager.set_hardware_coil_enabled(
             self.global_settings["hardware_coil_enabled"] == 1
@@ -3954,7 +4012,10 @@ class ForkliftSafetyGUI(QWidget):
                 self.global_settings["boot_self_test"] == 1
             )
             self.relay_manager.update_relay_mapping(
-                self.global_settings["relay_mapping"]
+                self.global_settings["relay_mapping"],
+                mapping_2=self.global_settings.get("relay_mapping_b"),
+                enable_1=self.global_settings.get("relay_a_active"),
+                enable_2=self.global_settings.get("relay_b_active")
             )
             self.relay_manager.set_hardware_coil_enabled(
                 self.global_settings["hardware_coil_enabled"] == 1

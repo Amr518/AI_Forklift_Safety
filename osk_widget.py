@@ -1,71 +1,104 @@
 # ============================================================
 # AI FORKLIFT SAFETY SYSTEM — ON-SCREEN KEYBOARD (OSK)
 # ============================================================
-# Architecture: In-process PyQt5 QWidget overlay.
+# Architecture: In-process PyQt5 QWidget overlay & Dialogs.
+# Bilingual: Full QWERTY English and Standard Arabic layouts.
 # Focus safety: All keys use Qt.NoFocus — the OSK never steals
 #               focus from the target QLineEdit.
 # Key injection: QLineEdit.insert() / .backspace() — works with
 #                both plain text and Password echo mode.
-# Layout: Classic PC QWERTY Keyboard with physical keycap styling.
-# Dialog: Stationary, cleanly centered, with no dragging or snap buttons.
+# Layout: Classic PC Keyboard with tactile keycap styling.
+# Dialogs: Stationary, cleanly centered, with no dragging or snap buttons.
 # ============================================================
 
+import os
+import json
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QSizePolicy, QApplication, QLabel,
     QLineEdit, QDialog, QAbstractSpinBox
 )
 from PyQt5.QtCore import Qt, QEvent, pyqtSignal
-from PyQt5.QtGui import QKeyEvent
+from PyQt5.QtGui import QKeyEvent, QColor
 
 
 # ============================================================
-# CLASSIC KEY LAYOUT & SHIFT MAP
+# CLASSIC KEY LAYOUTS & SHIFT MAPS
 # ============================================================
 
-# Classic QWERTY 5-Row Layout
-# Each tuple: (label, action, stretch_factor)
-CLASSIC_ROWS = [
-    # Row 0 — Numbers & Backspace (14 keys, total weight 150)
+ENGLISH_ROWS = [
+    # Row 0 — Numbers & Backspace (14 keys)
     [('`', '`', 10), ('1', '1', 10), ('2', '2', 10), ('3', '3', 10), ('4', '4', 10),
      ('5', '5', 10), ('6', '6', 10), ('7', '7', 10), ('8', '8', 10), ('9', '9', 10),
      ('0', '0', 10), ('-', '-', 10), ('=', '=', 10), ('⌫ BACKSPACE', '__BACKSPACE__', 20)],
 
-    # Row 1 — Tab, QWERTY & Backslash (14 keys, total weight 150)
+    # Row 1 — Tab, QWERTY & Backslash (14 keys)
     [('TAB', '__TAB__', 16), ('Q', 'q', 10), ('W', 'w', 10), ('E', 'e', 10), ('R', 'r', 10),
      ('T', 't', 10), ('Y', 'y', 10), ('U', 'u', 10), ('I', 'i', 10), ('O', 'o', 10),
      ('P', 'p', 10), ('[', '[', 10), (']', ']', 10), ('\\', '\\', 14)],
 
-    # Row 2 — Caps Lock, Home row & Enter (13 keys, total weight 150)
+    # Row 2 — Caps Lock, Home row & Enter (13 keys)
     [('⇪ CAPS', '__CAPS__', 18), ('A', 'a', 10), ('S', 's', 10), ('D', 'd', 10), ('F', 'f', 10),
      ('G', 'g', 10), ('H', 'h', 10), ('J', 'j', 10), ('K', 'k', 10), ('L', 'l', 10),
      (';', ';', 10), ("'", "'", 10), ('⏎ ENTER', '__ENTER__', 22)],
 
-    # Row 3 — Shift, ZXCV & Shift (12 keys, total weight 150)
+    # Row 3 — Shift, ZXCV & Shift (12 keys)
     [('⇧ SHIFT', '__SHIFT__', 24), ('Z', 'z', 10), ('X', 'x', 10), ('C', 'c', 10), ('V', 'v', 10),
      ('B', 'b', 10), ('N', 'n', 10), ('M', 'm', 10), (',', ',', 10), ('.', '.', 10),
      ('/', '/', 10), ('⇧ SHIFT', '__SHIFT__', 26)],
 
-    # Row 4 — Classic Centered Spacebar (total weight 150)
-    [('__SPACER__', None, 25), ('SPACE', '__SPACE__', 100), ('__SPACER__', None, 25)],
+    # Row 4 — Centered Spacebar & Language Toggle
+    [('🌐 AR/EN', '__LANG__', 25), ('SPACE', '__SPACE__', 100), ('🌐 AR/EN', '__LANG__', 25)],
 ]
 
-CLASSIC_SHIFT_MAP = {
+ENGLISH_SHIFT_MAP = {
     '`': '~', '1': '!', '2': '@', '3': '#', '4': '$', '5': '%',
     '6': '^', '7': '&', '8': '*', '9': '(', '0': ')', '-': '_', '=': '+',
     '[': '{', ']': '}', '\\': '|', ';': ':', "'": '"', ',': '<', '.': '>', '/': '?',
 }
 
+ARABIC_ROWS = [
+    # Row 0
+    [('ذ', 'ذ', 10), ('1', '1', 10), ('2', '2', 10), ('3', '3', 10), ('4', '4', 10),
+     ('5', '5', 10), ('6', '6', 10), ('7', '7', 10), ('8', '8', 10), ('9', '9', 10),
+     ('0', '0', 10), ('-', '-', 10), ('=', '=', 10), ('⌫ مسح', '__BACKSPACE__', 20)],
+
+    # Row 1
+    [('TAB', '__TAB__', 16), ('ض', 'ض', 10), ('ص', 'ص', 10), ('ث', 'ث', 10), ('ق', 'ق', 10),
+     ('ف', 'ف', 10), ('غ', 'غ', 10), ('ع', 'ع', 10), ('ه', 'ه', 10), ('خ', 'خ', 10),
+     ('ح', 'ح', 10), ('ج', 'ج', 10), ('د', 'د', 10), ('\\', '\\', 14)],
+
+    # Row 2
+    [('⇪ CAPS', '__CAPS__', 18), ('ش', 'ش', 10), ('س', 'س', 10), ('ي', 'ي', 10), ('ب', 'ب', 10),
+     ('ل', 'ل', 10), ('ا', 'ا', 10), ('ت', 'ت', 10), ('ن', 'ن', 10), ('م', 'م', 10),
+     ('ك', 'ك', 10), ('ط', 'ط', 10), ('⏎ دخول', '__ENTER__', 22)],
+
+    # Row 3
+    [('⇧ SHIFT', '__SHIFT__', 24), ('ئ', 'ئ', 10), ('ء', 'ء', 10), ('ؤ', 'ؤ', 10), ('ر', 'ر', 10),
+     ('لا', 'لا', 10), ('ى', 'ى', 10), ('ة', 'ة', 10), ('و', 'و', 10), ('ز', 'ز', 10),
+     ('ظ', 'ظ', 10), ('⇧ SHIFT', '__SHIFT__', 26)],
+
+    # Row 4
+    [('🌐 EN/AR', '__LANG__', 25), ('مسافة', '__SPACE__', 100), ('🌐 EN/AR', '__LANG__', 25)],
+]
+
+ARABIC_SHIFT_MAP = {
+    '1': '!', '2': '@', '3': '#', '4': '$', '5': '%',
+    '6': '^', '7': '&', '8': '*', '9': '(', '0': ')', '-': '_',
+    '=': '+', 'ض': 'َ', 'ص': 'ً', 'ث': 'ُ', 'ق': 'ٌ',
+    'ف': 'لإ', 'غ': 'إ', 'ع': '‘', 'ه': '÷', 'خ': '×',
+    'ح': '؛', 'ج': '<', 'د': '>', 'ش': 'ِ', 'س': 'ٍ',
+    'ي': ']', 'ب': '[', 'ل': 'لأ', 'ا': 'أ', 'ت': 'ـ',
+    'ن': '،', 'ك': ':', 'ط': '"', 'ئ': '~', 'ء': 'ْ',
+    'ؤ': '}', 'ر': '{', 'لا': 'لآ', 'ى': 'آ', 'ة': '’',
+    'و': ',', 'ز': '.', 'ظ': '؟'
+}
+
 
 # ============================================================
-# INDIVIDUAL KEY BUTTON (REALISTIC CLASSIC KEYCAP)
+# STYLED OSK KEY CAP
 # ============================================================
 class OSKKey(QPushButton):
-    """
-    A single key on the classic on-screen keyboard.
-    Always uses Qt.NoFocus to prevent stealing input focus.
-    Styled with 3D beveled keycap edges for a classic physical feel.
-    """
     def __init__(self, label: str, action: str, key_type: str = "normal", parent=None):
         super().__init__(label, parent)
         self.action = action
@@ -73,141 +106,85 @@ class OSKKey(QPushButton):
         self.setFocusPolicy(Qt.NoFocus)
         self.setAttribute(Qt.WA_AcceptTouchEvents, True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumHeight(64)
-        self._apply_style(key_type)
-
-    def _apply_style(self, ktype: str):
-        self.key_type = ktype
-        if ktype == "action":  # ENTER key (Classic blue accent)
-            self.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2563eb, stop:1 #1d4ed8);
-                    border-top: 1px solid #60a5fa;
-                    border-left: 1px solid #1d4ed8;
-                    border-right: 1px solid #1d4ed8;
-                    border-bottom: 3px solid #172554;
-                    border-radius: 7px;
-                    color: #ffffff;
-                    font-family: 'Segoe UI', 'Arial', sans-serif;
-                    font-size: 18px;
-                    font-weight: bold;
-                    padding: 4px;
-                }
-                QPushButton:pressed {
-                    background: #1e40af;
-                    border-top: 2px solid #172554;
-                    border-bottom: 1px solid #60a5fa;
-                    color: #bfdbfe;
-                }
-            """)
-        elif ktype in ("modifier", "caps_off", "shift_off"):  # Tab, Caps, Shift, Backspace
-            self.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #242c3b, stop:1 #181e29);
-                    border-top: 1px solid #3b4658;
-                    border-left: 1px solid #232a36;
-                    border-right: 1px solid #232a36;
-                    border-bottom: 3px solid #0f141c;
-                    border-radius: 7px;
-                    color: #94a3b8;
-                    font-family: 'Segoe UI', 'Arial', sans-serif;
-                    font-size: 16px;
-                    font-weight: bold;
-                    padding: 4px;
-                }
-                QPushButton:pressed {
-                    background: #131822;
-                    border-top: 2px solid #0f141c;
-                    border-bottom: 1px solid #3b4658;
-                    color: #e2e8f0;
-                }
-            """)
-        elif ktype in ("caps_on", "shift_on"):  # Active Caps / Shift (Illuminated)
-            self.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1d4ed8, stop:1 #1e3a8a);
-                    border-top: 1px solid #93c5fd;
-                    border-left: 1px solid #3b82f6;
-                    border-right: 1px solid #3b82f6;
-                    border-bottom: 3px solid #0f172a;
-                    border-radius: 7px;
-                    color: #ffffff;
-                    font-family: 'Segoe UI', 'Arial', sans-serif;
-                    font-size: 16px;
-                    font-weight: bold;
-                    padding: 4px;
-                }
-                QPushButton:pressed {
-                    background: #172554;
-                }
-            """)
-        elif ktype == "space":  # Wide Spacebar
-            self.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2a3344, stop:1 #1c2330);
-                    border-top: 1px solid #44536d;
-                    border-left: 1px solid #2b3547;
-                    border-right: 1px solid #2b3547;
-                    border-bottom: 3px solid #111622;
-                    border-radius: 7px;
-                    color: #94a3b8;
-                    font-family: 'Segoe UI', 'Arial', sans-serif;
-                    font-size: 16px;
-                    font-weight: bold;
-                    padding: 4px;
-                    letter-spacing: 2px;
-                }
-                QPushButton:pressed {
-                    background: #141923;
-                    border-top: 2px solid #111622;
-                    border-bottom: 1px solid #44536d;
-                    color: #60a5fa;
-                }
-            """)
-        else:  # Normal Alphanumeric Key
-            self.setStyleSheet("""
-                QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2a3344, stop:1 #1c2330);
-                    border-top: 1px solid #44536d;
-                    border-left: 1px solid #2b3547;
-                    border-right: 1px solid #2b3547;
-                    border-bottom: 3px solid #111622;
-                    border-radius: 7px;
-                    color: #f8fafc;
-                    font-family: 'Segoe UI', 'Arial', sans-serif;
-                    font-size: 22px;
-                    font-weight: bold;
-                    padding: 4px;
-                }
-                QPushButton:pressed {
-                    background: #141923;
-                    border-top: 2px solid #111622;
-                    border-bottom: 1px solid #44536d;
-                    color: #60a5fa;
-                }
-            """)
+        self.setMinimumHeight(44)
+        self._apply_style(False)
 
     def set_active(self, active: bool):
-        if self.action == '__SHIFT__':
-            self._apply_style("shift_on" if active else "shift_off")
-        elif self.action == '__CAPS__':
-            self._apply_style("caps_on" if active else "caps_off")
+        self._apply_style(active)
 
-    def set_shift_active(self, active: bool):
-        self.set_active(active)
+    def _apply_style(self, active: bool = False):
+        if self.key_type == "action":
+            # Enter Key — Industrial Green
+            bg = "#15803d" if not active else "#16a34a"
+            hover_bg = "#16a34a"
+            border = "#22c55e"
+            color = "#ffffff"
+            font_size = "12px"
+            font_weight = "bold"
+        elif self.key_type == "modifier":
+            # Backspace, Tab, Lang — Slate
+            bg = "#1e293b"
+            hover_bg = "#334155"
+            border = "#475569"
+            color = "#94a3b8"
+            font_size = "11px"
+            font_weight = "bold"
+        elif self.key_type in ("caps_off", "shift_off"):
+            if active:
+                bg = "#1d4ed8"
+                hover_bg = "#2563eb"
+                border = "#3b82f6"
+                color = "#ffffff"
+            else:
+                bg = "#1e293b"
+                hover_bg = "#334155"
+                border = "#475569"
+                color = "#94a3b8"
+            font_size = "11px"
+            font_weight = "bold"
+        elif self.key_type == "space":
+            bg = "#0f172a"
+            hover_bg = "#1e293b"
+            border = "#334155"
+            color = "#94a3b8"
+            font_size = "11px"
+            font_weight = "normal"
+        else:
+            # Normal alphanumeric keycap
+            bg = "#182234"
+            hover_bg = "#24334a"
+            border = "#2e415e"
+            color = "#e2e8f0"
+            font_size = "13px"
+            font_weight = "bold"
 
-    def set_type(self, key_type: str):
-        self._apply_style(key_type)
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {bg};
+                color: {color};
+                border: 1px solid {border};
+                border-radius: 6px;
+                font-family: 'Segoe UI', 'Ubuntu', sans-serif;
+                font-size: {font_size};
+                font-weight: {font_weight};
+                padding: 4px;
+            }}
+            QPushButton:hover {{
+                background-color: {hover_bg};
+                border-color: #60a5fa;
+            }}
+            QPushButton:pressed {{
+                background-color: #3b82f6;
+                color: #ffffff;
+                border-color: #93c5fd;
+            }}
+        """)
 
 
 # ============================================================
-# MAIN OSK WIDGET (CLASSIC KEYBOARD)
+# MAIN OSK WIDGET (CLASSIC BILINGUAL KEYBOARD)
 # ============================================================
 class OSKWidget(QWidget):
-    """
-    Classic QWERTY On-Screen Keyboard overlay for industrial HMI.
-    Embedded directly into authentication & input dialogs.
-    """
     enter_pressed = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -218,20 +195,22 @@ class OSKWidget(QWidget):
 
         self._shift_active = False
         self._caps_active = False
+        self._lang = "EN"
         self._all_keys: list[OSKKey] = []
 
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(4, 4, 4, 4)
-        main_layout.setSpacing(6)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(6, 6, 6, 6)
+        self.main_layout.setSpacing(6)
 
         self.setStyleSheet("""
             QWidget {
                 background-color: #0b0e14;
+                border: 1px solid #1e293b;
                 border-radius: 10px;
             }
         """)
 
-        self._build_classic_layout(main_layout)
+        self._rebuild_layout()
 
     def set_target(self, widget):
         self._target_widget = widget
@@ -249,10 +228,18 @@ class OSKWidget(QWidget):
             return fw
         return None
 
-    def _build_classic_layout(self, layout: QVBoxLayout):
-        self._all_keys.clear()
+    def _rebuild_layout(self):
+        # Clear existing keys
+        while self.main_layout.count():
+            item = self.main_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
 
-        for row in CLASSIC_ROWS:
+        self._all_keys.clear()
+        current_rows = ARABIC_ROWS if self._lang == "AR" else ENGLISH_ROWS
+
+        for row in current_rows:
             row_widget = QWidget(self)
             row_widget.setFocusPolicy(Qt.NoFocus)
             row_widget.setAttribute(Qt.WA_AcceptTouchEvents, True)
@@ -268,7 +255,7 @@ class OSKWidget(QWidget):
 
                 if action == '__ENTER__':
                     ktype = "action"
-                elif action in ('__BACKSPACE__', '__TAB__'):
+                elif action in ('__BACKSPACE__', '__TAB__', '__LANG__'):
                     ktype = "modifier"
                 elif action == '__CAPS__':
                     ktype = "caps_off"
@@ -284,7 +271,7 @@ class OSKWidget(QWidget):
                 row_layout.addWidget(key, stretch=stretch)
                 self._all_keys.append(key)
 
-            layout.addWidget(row_widget)
+            self.main_layout.addWidget(row_widget)
 
     def _on_key_pressed(self, key: OSKKey):
         action = key.action
@@ -297,6 +284,9 @@ class OSKWidget(QWidget):
             self._do_enter()
         elif action == '__TAB__':
             self._inject('    ')
+        elif action == '__LANG__':
+            self._lang = "AR" if self._lang == "EN" else "EN"
+            self._rebuild_layout()
         elif action == '__CAPS__':
             self._caps_active = not self._caps_active
             self._update_display()
@@ -306,32 +296,35 @@ class OSKWidget(QWidget):
         else:
             char = action
             uppercase = self._caps_active ^ self._shift_active
-            if self._shift_active and char in CLASSIC_SHIFT_MAP:
-                char = CLASSIC_SHIFT_MAP[char]
-            elif uppercase:
+            shift_map = ARABIC_SHIFT_MAP if self._lang == "AR" else ENGLISH_SHIFT_MAP
+
+            if self._shift_active and char in shift_map:
+                char = shift_map[char]
+            elif uppercase and self._lang == "EN":
                 char = char.upper()
-            else:
+            elif not uppercase and self._lang == "EN":
                 char = char.lower()
 
             self._inject(char)
 
-            # Auto-release one-shot Shift after character press
             if self._shift_active:
                 self._shift_active = False
                 self._update_display()
 
     def _update_display(self):
         uppercase = self._caps_active ^ self._shift_active
+        shift_map = ARABIC_SHIFT_MAP if self._lang == "AR" else ENGLISH_SHIFT_MAP
+
         for key in self._all_keys:
             if key.action == '__SHIFT__':
                 key.set_active(self._shift_active)
             elif key.action == '__CAPS__':
                 key.set_active(self._caps_active)
-            elif len(key.action) == 1 and key.action.isalpha():
+            elif len(key.action) == 1 and key.action.isalpha() and self._lang == "EN":
                 key.setText(key.action.upper() if uppercase else key.action.lower())
-            elif key.action in CLASSIC_SHIFT_MAP:
+            elif key.action in shift_map:
                 if self._shift_active:
-                    key.setText(CLASSIC_SHIFT_MAP[key.action])
+                    key.setText(shift_map[key.action])
                 else:
                     key.setText(key.action)
 
@@ -375,182 +368,26 @@ TouchKeyboardWidget = OSKWidget
 # STATIONARY FRAMELESS DIALOG (NO DRAGGING, LOCKED IN PLACE)
 # ============================================================
 class StationaryFramelessDialog(QDialog):
-    """
-    Clean, non-draggable modal dialog for industrial touchscreens.
-    Locked in place — cannot be moved with mouse or touch gestures.
-    Centered automatically on the primary display or parent window.
-    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WA_AcceptTouchEvents, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setModal(True)
 
-    def center_on_screen(self):
-        if self.parentWidget():
-            geo = self.parentWidget().geometry()
-            x = max(10, geo.x() + (geo.width() - self.width()) // 2)
-            y = max(10, geo.y() + (geo.height() - self.height()) // 2)
-            self.move(x, y)
-        else:
-            screen = QApplication.primaryScreen().geometry() if QApplication.primaryScreen() else None
-            if screen:
-                x = max(10, (screen.width() - self.width()) // 2)
-                y = max(10, (screen.height() - self.height()) // 2)
-                self.move(x, y)
+    def mousePressEvent(self, event):
+        event.accept()
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        self.center_on_screen()
+    def mouseMoveEvent(self, event):
+        event.accept()
 
-
-# For backward compatibility
-DraggableFramelessDialog = StationaryFramelessDialog
-DraggableHeaderBar = QWidget
+    def mouseReleaseEvent(self, event):
+        event.accept()
 
 
 # ============================================================
-# INDUSTRIAL TOUCH TEXT INPUT DIALOG (CLASSIC DESIGN)
-# ============================================================
-class TouchInputDialog(StationaryFramelessDialog):
-    """
-    Touchscreen-native text input dialog with classic keyboard.
-    Non-draggable, stationary, and cleanly centered.
-    """
-    def __init__(self, parent=None, title="Text Input", prompt="Enter Value:", default_text=""):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #0b0f19;
-                border: 2px solid #2b3d54;
-                border-radius: 14px;
-            }
-        """)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 18)
-        layout.setSpacing(12)
-
-        # Header bar — clean, classic, NO drag handle, NO snap buttons
-        header_bar = QWidget(self)
-        header_layout = QHBoxLayout(header_bar)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(12)
-
-        header_icon = QLabel("⌨")
-        header_icon.setStyleSheet("font-size: 24px;")
-        header_layout.addWidget(header_icon)
-
-        title_lbl = QLabel(title.upper())
-        title_lbl.setStyleSheet("color: #f1f5f9; font-family: 'Segoe UI', 'Arial'; font-size: 18px; font-weight: bold; letter-spacing: 1px;")
-        header_layout.addWidget(title_lbl)
-
-        header_layout.addStretch()
-
-        # Clean Close Button
-        btn_close = QPushButton("✕ CLOSE")
-        btn_close.setFixedSize(95, 38)
-        btn_close.setFocusPolicy(Qt.NoFocus)
-        btn_close.setStyleSheet("""
-            QPushButton {
-                background-color: #3b1111;
-                color: #fca5a5;
-                border: 1px solid #991b1b;
-                border-radius: 7px;
-                font-size: 13px;
-                font-weight: bold;
-            }
-            QPushButton:pressed {
-                background-color: #b91c1c;
-                color: white;
-            }
-        """)
-        btn_close.clicked.connect(self.reject)
-        header_layout.addWidget(btn_close)
-        layout.addWidget(header_bar)
-
-        # Prompt
-        prompt_lbl = QLabel(prompt)
-        prompt_lbl.setStyleSheet("color: #94a3b8; font-size: 15px; font-family: 'Segoe UI', sans-serif;")
-        layout.addWidget(prompt_lbl)
-
-        # Input container
-        input_container = QWidget()
-        input_container.setFixedHeight(60)
-        input_container.setStyleSheet("""
-            QWidget {
-                background-color: #131b2e;
-                border: 2px solid #3b82f6;
-                border-radius: 10px;
-            }
-        """)
-        input_row = QHBoxLayout(input_container)
-        input_row.setContentsMargins(14, 4, 10, 4)
-        input_row.setSpacing(10)
-
-        self.text_edit = QLineEdit()
-        self.text_edit.setText(default_text)
-        self.text_edit.setPlaceholderText("Enter text and press ENTER...")
-        self.text_edit.setStyleSheet("""
-            QLineEdit {
-                background: transparent;
-                border: none;
-                color: #ffffff;
-                font-size: 24px;
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-            }
-        """)
-        self.text_edit.returnPressed.connect(self.accept)
-        input_row.addWidget(self.text_edit, stretch=1)
-
-        # Clear button
-        self.btn_clear = QPushButton("✖")
-        self.btn_clear.setFixedSize(50, 50)
-        self.btn_clear.setFocusPolicy(Qt.NoFocus)
-        self.btn_clear.setStyleSheet("""
-            QPushButton {
-                background-color: #1e293b;
-                color: #94a3b8;
-                border: none;
-                border-radius: 8px;
-                font-size: 18px;
-            }
-            QPushButton:pressed {
-                background-color: #334155;
-                color: #ffffff;
-            }
-        """)
-        self.btn_clear.clicked.connect(self.text_edit.clear)
-        input_row.addWidget(self.btn_clear)
-
-        layout.addWidget(input_container)
-
-        # Embedded Classic OSK
-        self.embedded_osk = OSKWidget(parent=self)
-        self.embedded_osk.set_target(self.text_edit)
-        self.embedded_osk.enter_pressed.connect(self.accept)
-        layout.addWidget(self.embedded_osk)
-
-        self.resize(1360, 580)
-        self.setMinimumSize(1200, 540)
-        self.text_edit.setFocus()
-
-    @classmethod
-    def get_text(cls, parent=None, title="Text Input", prompt="Enter Value:", default_text="") -> tuple[str, bool]:
-        dlg = cls(parent=parent, title=title, prompt=prompt, default_text=default_text)
-        dlg.center_on_screen()
-        res = dlg.exec_()
-        return dlg.text_edit.text(), (res == QDialog.Accepted)
-
-
-# ============================================================
-# INDUSTRIAL TOUCH PASSWORD DIALOG (CLASSIC DESIGN)
+# TOUCHSCREEN PASSWORD AUTHENTICATION DIALOG
 # ============================================================
 class TouchPasswordDialog(StationaryFramelessDialog):
-    """
-    Touchscreen-native authentication dialog with classic keyboard.
-    Non-draggable, stationary, and cleanly centered.
-    """
     def __init__(self, parent=None, title="Access Authorization", prompt="Enter Password:", role=""):
         super().__init__(parent)
         self.role = role
@@ -563,163 +400,157 @@ class TouchPasswordDialog(StationaryFramelessDialog):
             }
         """)
 
-        # Main layout
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 16, 20, 18)
         layout.setSpacing(12)
 
-        # Header bar — clean, classic, NO drag handle, NO snap buttons
         header_bar = QWidget(self)
         header_layout = QHBoxLayout(header_bar)
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(12)
 
-        header_icon = QLabel("🔒")
-        header_icon.setStyleSheet("font-size: 24px;")
-        header_layout.addWidget(header_icon)
+        icon_label = QLabel("🔒", header_bar)
+        icon_label.setStyleSheet("font-size: 18px; color: #3b82f6; background: transparent;")
+        header_layout.addWidget(icon_label)
 
-        title_lbl = QLabel(title.upper())
-        title_lbl.setStyleSheet("color: #f1f5f9; font-family: 'Segoe UI', 'Arial'; font-size: 18px; font-weight: bold; letter-spacing: 1px;")
-        header_layout.addWidget(title_lbl)
+        title_label = QLabel(title, header_bar)
+        title_label.setStyleSheet("font-family: 'Segoe UI Semibold'; font-size: 14px; font-weight: bold; color: #f1f5f9; background: transparent;")
+        header_layout.addWidget(title_label)
 
         if role:
-            role_badge = QLabel(f"  ROLE: {role.upper()}  ")
-            role_badge.setStyleSheet("""
-                background-color: #1e3a8a;
-                color: #93c5fd;
-                font-family: 'Segoe UI', 'Arial';
-                font-size: 13px;
-                font-weight: bold;
-                border-radius: 5px;
-                padding: 4px 12px;
-                border: 1px solid #2563eb;
-            """)
+            role_badge = QLabel(f"[{role.upper()}]", header_bar)
+            role_badge.setStyleSheet("font-family: 'Segoe UI Semibold'; font-size: 11px; font-weight: bold; color: #38bdf8; background: #0c4a6e; border-radius: 4px; padding: 2px 8px;")
             header_layout.addWidget(role_badge)
 
         header_layout.addStretch()
 
-        # Clean Close Button
-        btn_close = QPushButton("✕ CLOSE")
-        btn_close.setFixedSize(95, 38)
+        btn_close = QPushButton("✕", header_bar)
         btn_close.setFocusPolicy(Qt.NoFocus)
+        btn_close.setFixedSize(30, 30)
         btn_close.setStyleSheet("""
             QPushButton {
-                background-color: #3b1111;
-                color: #fca5a5;
-                border: 1px solid #991b1b;
-                border-radius: 7px;
-                font-size: 13px;
-                font-weight: bold;
+                background: #1e293b; color: #94a3b8; border: 1px solid #334155;
+                border-radius: 6px; font-size: 14px; font-weight: bold;
             }
-            QPushButton:pressed {
-                background-color: #b91c1c;
-                color: white;
-            }
+            QPushButton:hover { background: #dc2626; color: #ffffff; border-color: #ef4444; }
         """)
         btn_close.clicked.connect(self.reject)
         header_layout.addWidget(btn_close)
         layout.addWidget(header_bar)
 
-        # Prompt
-        prompt_lbl = QLabel(prompt)
-        prompt_lbl.setStyleSheet("color: #94a3b8; font-size: 15px; font-family: 'Segoe UI', sans-serif;")
-        layout.addWidget(prompt_lbl)
+        sep = QWidget(self)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background-color: #1e293b;")
+        layout.addWidget(sep)
 
-        # Input container
-        input_container = QWidget()
-        input_container.setFixedHeight(60)
-        input_container.setStyleSheet("""
-            QWidget {
-                background-color: #131b2e;
-                border: 2px solid #3b82f6;
-                border-radius: 10px;
-            }
-        """)
-        input_row = QHBoxLayout(input_container)
-        input_row.setContentsMargins(14, 4, 10, 4)
-        input_row.setSpacing(10)
+        input_container = QWidget(self)
+        input_layout = QVBoxLayout(input_container)
+        input_layout.setContentsMargins(0, 4, 0, 4)
+        input_layout.setSpacing(6)
 
-        self.password_edit = QLineEdit()
+        prompt_label = QLabel(prompt, input_container)
+        prompt_label.setStyleSheet("font-family: 'Segoe UI'; font-size: 12px; color: #94a3b8;")
+        input_layout.addWidget(prompt_label)
+
+        entry_row = QHBoxLayout()
+        entry_row.setSpacing(8)
+
+        self.password_edit = QLineEdit(input_container)
         self.password_edit.setEchoMode(QLineEdit.Password)
-        self.password_edit.setPlaceholderText("Enter password and press ENTER...")
+        self.password_edit.setPlaceholderText("Type password using on-screen keyboard below...")
+        self.password_edit.setMinimumHeight(44)
         self.password_edit.setStyleSheet("""
             QLineEdit {
-                background: transparent;
-                border: none;
-                color: #ffffff;
-                font-size: 28px;
-                font-family: 'Segoe UI', 'Arial', monospace;
-                letter-spacing: 4px;
+                background-color: #111827; color: #38bdf8; border: 2px solid #1e3a5f;
+                border-radius: 8px; font-size: 16px; font-weight: bold; padding: 0 12px; letter-spacing: 2px;
             }
+            QLineEdit:focus { border: 2px solid #3b82f6; background-color: #0f172a; }
         """)
-        self.password_edit.returnPressed.connect(self.accept)
-        input_row.addWidget(self.password_edit, stretch=1)
+        entry_row.addWidget(self.password_edit, stretch=1)
 
-        # Clear button
-        self.btn_clear = QPushButton("✖")
-        self.btn_clear.setFixedSize(50, 50)
-        self.btn_clear.setFocusPolicy(Qt.NoFocus)
-        self.btn_clear.setToolTip("Clear text")
-        self.btn_clear.setStyleSheet("""
+        self.btn_toggle_echo = QPushButton("👁", input_container)
+        self.btn_toggle_echo.setFocusPolicy(Qt.NoFocus)
+        self.btn_toggle_echo.setFixedSize(44, 44)
+        self.btn_toggle_echo.setToolTip("Toggle Password Visibility")
+        self.btn_toggle_echo.setStyleSheet("""
             QPushButton {
-                background-color: #1e293b;
-                color: #94a3b8;
-                border: none;
-                border-radius: 8px;
-                font-size: 18px;
+                background: #1e293b; color: #94a3b8; border: 1px solid #334155;
+                border-radius: 8px; font-size: 16px;
             }
-            QPushButton:pressed {
-                background-color: #334155;
-                color: #ffffff;
-            }
+            QPushButton:hover { background: #334155; color: #ffffff; }
         """)
-        self.btn_clear.clicked.connect(self.password_edit.clear)
-        input_row.addWidget(self.btn_clear)
-
-        # Eye button (Show/Hide password)
-        self.btn_eye = QPushButton("👁")
-        self.btn_eye.setFixedSize(50, 50)
-        self.btn_eye.setFocusPolicy(Qt.NoFocus)
-        self.btn_eye.setToolTip("Show / Hide password")
-        self.btn_eye.setStyleSheet("""
-            QPushButton {
-                background-color: #1e293b;
-                color: #60a5fa;
-                border: 1px solid #2563eb;
-                border-radius: 8px;
-                font-size: 22px;
-            }
-            QPushButton:pressed {
-                background-color: #2563eb;
-                color: #ffffff;
-            }
-        """)
-        self.btn_eye.clicked.connect(self._toggle_echo_mode)
-        input_row.addWidget(self.btn_eye)
-
+        self.btn_toggle_echo.clicked.connect(self._toggle_echo)
+        entry_row.addWidget(self.btn_toggle_echo)
+        input_layout.addLayout(entry_row)
         layout.addWidget(input_container)
 
-        # Embedded Classic OSK
-        self.embedded_osk = OSKWidget(parent=self)
-        self.embedded_osk.set_target(self.password_edit)
-        self.embedded_osk.enter_pressed.connect(self.accept)
-        layout.addWidget(self.embedded_osk)
+        self.keyboard = OSKWidget(self)
+        self.keyboard.set_target(self.password_edit)
+        self.keyboard.enter_pressed.connect(self._on_enter_pressed)
+        layout.addWidget(self.keyboard)
 
-        self.resize(1360, 580)
-        self.setMinimumSize(1200, 540)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+
+        btn_cancel = QPushButton("CANCEL", self)
+        btn_cancel.setFocusPolicy(Qt.NoFocus)
+        btn_cancel.setMinimumHeight(40)
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background: #1e293b; color: #94a3b8; border: 1px solid #334155;
+                border-radius: 8px; font-size: 12px; font-weight: bold; padding: 0 20px;
+            }
+            QPushButton:hover { background: #334155; color: #f1f5f9; }
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+
+        btn_row.addStretch()
+
+        self.btn_ok = QPushButton("AUTHENTICATE  →", self)
+        self.btn_ok.setFocusPolicy(Qt.NoFocus)
+        self.btn_ok.setMinimumHeight(40)
+        self.btn_ok.setStyleSheet("""
+            QPushButton {
+                background: #1d4ed8; color: #ffffff; border: 1px solid #3b82f6;
+                border-radius: 8px; font-size: 12px; font-weight: bold; padding: 0 28px;
+            }
+            QPushButton:hover { background: #2563eb; }
+            QPushButton:pressed { background: #1e40af; }
+        """)
+        self.btn_ok.clicked.connect(self.accept)
+        btn_row.addWidget(self.btn_ok)
+        layout.addLayout(btn_row)
+
+        self.password_edit.returnPressed.connect(self.accept)
+        self.adjustSize()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.parent():
+            parent_geo = self.parent().geometry()
+            x = parent_geo.x() + (parent_geo.width() - self.width()) // 2
+            y = parent_geo.y() + (parent_geo.height() - self.height()) // 2
+            self.move(max(0, x), max(0, y))
         self.password_edit.setFocus()
+        self.keyboard.set_target(self.password_edit)
 
-    def _toggle_echo_mode(self):
+    def _toggle_echo(self):
         if self.password_edit.echoMode() == QLineEdit.Password:
             self.password_edit.setEchoMode(QLineEdit.Normal)
-            self.btn_eye.setText("🙈")
+            self.btn_toggle_echo.setText("🔒")
         else:
             self.password_edit.setEchoMode(QLineEdit.Password)
-            self.btn_eye.setText("👁")
+            self.btn_toggle_echo.setText("👁")
 
-    @classmethod
-    def get_password(cls, parent=None, title="Access Authorization", prompt="Enter Password:", role="") -> tuple[str, bool]:
-        dlg = cls(parent=parent, title=title, prompt=prompt, role=role)
-        dlg.center_on_screen()
-        res = dlg.exec_()
-        return dlg.password_edit.text(), (res == QDialog.Accepted)
+    def _on_enter_pressed(self):
+        self.accept()
+
+    def text(self) -> str:
+        return self.password_edit.text()
+
+    @staticmethod
+    def get_password(parent=None, title="Authentication Required", prompt="Enter Password:", role=""):
+        dlg = TouchPasswordDialog(parent=parent, title=title, prompt=prompt, role=role)
+        result = dlg.exec_()
+        return dlg.text(), (result == QDialog.Accepted)

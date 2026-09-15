@@ -92,28 +92,35 @@ The system employs a hardened **Two-Process Decoupled Architecture** connected v
 - **Problem**: In industrial vehicles, mechanical vibrations frequently dislodge USB camera connectors. Linux kernel V4L2 then re-enumerates cameras randomly (e.g., swapping `/dev/video0` and `/dev/video2`), causing critical rear-blindspot cameras to swap with front-view cameras.
 - **Solution**: The system resolves the physical motherboard USB bus topology (`sysfs`: `/sys/class/video4linux/videoX/device`) and binds each camera station to its immutable physical port path (e.g., `1-1.2`, `1-1.4`). Cameras will never swap, even across dynamic re-plugging or re-enumeration.
 
-### 2. ⚡ Pure Stateless Software OR-Gate
+### 2. ⚡ Pure Stateless Software OR-Gate with Dual Relay Mapping
 - The hardware daemon (`hardware_worker.py`) implements a zero-timer, pure boolean OR-gate logic cycle every 50 ms.
-- Multiple camera stations can be mapped to the same physical relay channel without race conditions.
+- **Dual Relay Assignments**: Each camera station can independently control two physical relay channels simultaneously (`Relay A` and `Relay B`), allowing dual action (e.g., strobe warning on Relay 1 AND emergency machine interlock on Relay 4).
 - **Edge-Triggered Output**: ASCII commands (`N<ch>` / `F<ch>`) are dispatched strictly on genuine state transitions, avoiding serial buffer flooding.
 
-### 3. 📐 Normalized ROI Geometry (0.0 to 1.0)
+### 3. 📊 Modular Health Diagnostics & Shift Reporting Engine
+- **Health Diagnostics (`health_diagnostics.py`)**: Real-time monitoring of CPU, RAM, CPU Temperature, per-camera FPS, processing latency, and dropped frames.
+- **Incident & Shift Reports (`report_manager.py` & `reporting_page.py`)**: Automatic generation of high-resolution PDF and TXT safety audit reports with embedded intrusion violation screenshots.
+- **Automated Incident Emailing (`email_manager.py`)**: SMTP alerting service with local offline queue (`email_queue.json`) and retry persistence.
+- **Automated Storage Management (`storage_manager.py`)**: Smart retention policies and monthly ZIP archiving of historical incident captures.
+
+### 4. 📐 Normalized ROI Geometry (0.0 to 1.0)
 - Region of Interest (hazard zone) coordinates are stored as floating-point ratios relative to frame dimensions:
   $$\text{norm\_x} = \frac{x}{W}, \quad \text{norm\_y} = \frac{y}{H}, \quad \text{norm\_w} = \frac{w}{W}, \quad \text{norm\_h} = \frac{h}{H}$$
 - Eliminates bounding-box drift when changing resolutions, resizing windows, or running across displays from $800 \times 480$ embedded panels up to $3840 \times 2160$ 4K screens.
 
-### 4. ⌨️ Integrated Touchscreen Virtual Keyboard (OSK)
-- Purpose-built on-screen keyboard (`OSKWidget`) supporting QWERTY, Numeric keypad, and Symbols.
-- Automatically hooks into text inputs, numerical spinboxes, and configuration dialogs. No physical keyboard or mouse required inside the forklift cab.
+### 5. ⌨️ Bilingual Touchscreen Virtual Keyboard (AR / EN OSK)
+- Purpose-built on-screen keyboard (`OSKWidget`) supporting **Arabic and English** layouts, Numeric keypad, and Symbols.
+- Automatically hooks into text inputs, numerical spinboxes, and configuration dialogs via `TouchPasswordDialog` without stealing focus (`Qt.NoFocus`).
 
-### 5. 🔐 4-Tier Role-Based Access Control (RBAC)
+### 6. 🔐 5-Tier Role-Based Access Control (RBAC)
 - **Operator (Level 1)**: Live monitoring, fullscreen viewing, manual channel activation.
-- **Supervisor (Level 2)**: ROI calibration, camera assignment, relay mapping, clean shutdown.
-- **Engineer (Level 3)**: Baud rates, serial ports, YOLO confidence thresholds, model reload.
-- **Administrator (Level 4)**: Software coil isolation, password management, system reset.
+- **Technician (Level 2)**: Diagnostics viewing, sensor verification.
+- **Supervisor (Level 3)**: ROI calibration, camera assignment, relay mapping, report generation.
+- **Engineer (Level 4)**: Baud rates, serial ports, YOLO confidence thresholds, model reload.
+- **Administrator (Level 5)**: Software coil isolation, password management, system reset.
 - Includes a 5-minute inactivity timer with automatic security fallback to Operator level.
 
-### 6. 🔄 Resilient Systemd User Service & Auto-Recovery
+### 7. 🔄 Resilient Systemd User Service & Auto-Recovery
 - Self-healing systemd service (`forklift-ai.service`) with automatic 3-second recovery on failure (`Restart=always`).
 - Includes a 15-second hardware stabilization delay at cold boot to ensure USB hubs and serial controllers enumerate completely before GUI initialization.
 
@@ -132,13 +139,18 @@ AI_Forklift_Safety/
 ├── .gitignore                             # Git ignore rules for clean repository
 │
 ├── ai_gui_system.py                       # Main Qt5 HMI application, YOLO inference & video pipeline
-├── hardware_worker.py                     # Standalone Hardware Daemon (Unix Socket + Pure OR-Gate)
+├── hardware_worker.py                     # Standalone Hardware Daemon (Unix Socket + Dual Relay OR-Gate)
 ├── hardware_manager.py                    # IPC Client adapter, Debounce & Hold logic
-├── osk_widget.py                          # Industrial On-Screen Virtual Touch Keyboard
+├── health_diagnostics.py                  # System health, temperature, FPS & latency diagnostics engine
+├── report_manager.py                      # PDF (ReportLab) and TXT shift report generator
+├── reporting_page.py                      # HMI Reporting & Email management tab
+├── email_manager.py                       # Automated incident email dispatcher with offline queue
+├── storage_manager.py                     # Automated disk retention and monthly ZIP archiver
+├── osk_widget.py                          # Industrial Bilingual (AR/EN) Virtual Touch Keyboard
 ├── detector.py                            # Ultralytics YOLOv8 object detection wrapper
-├── roi.py                                 # Region of Interest math & interactive viewport label
+├── roi.py                                 # Normalized Region of Interest math & interactive label
 ├── camera.py                              # V4L2 OpenCV video capture abstraction
-├── security.py                            # Role-based access control (RBAC) & hashing
+├── security.py                            # 5-Tier Role-based access control (RBAC) & hashing
 │
 ├── start_system.sh                        # Multi-process orchestrator & startup manager
 ├── setup_usb.sh                           # Udev rules installer for persistent /dev/forklift_relay
@@ -150,7 +162,7 @@ AI_Forklift_Safety/
 ├── security.json                          # RBAC credentials & role definition store
 ├── yolov8n.pt                             # Pre-trained YOLOv8 Nano model weights
 │
-├── test_or_gate_logic.py                  # Unit tests: Hardware OR-gate logic & stress latency
+├── test_or_gate_logic.py                  # Unit tests: 16 Test Cases + 10,000-cycle stress test
 ├── scratch/                               # Automated verification suites
 │   ├── test_physical_usb_binding.py       # USB Hub topology binding tests (9/9 PASS)
 │   ├── test_roi_and_layout_stability.py   # ROI scaling and layout tests (5/5 PASS)

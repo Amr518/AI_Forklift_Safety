@@ -106,6 +106,9 @@ HardwareWorker = _hw_mod.HardwareWorker
 def make_state(
     station_triggers: dict = None,
     relay_mapping:    list  = None,
+    relay_mapping_2:  list  = None,
+    relay_enable_1:   list  = None,
+    relay_enable_2:   list  = None,
     coil_enabled:     int   = 1,
     manual_test:      int   = 0,
 ) -> SharedState:
@@ -117,6 +120,9 @@ def make_state(
     state._lock = threading.Lock()
 
     mapping = relay_mapping or [1, 2, 3, 4]
+    mapping_2 = relay_mapping_2 or [None, None, None, None]
+    enable_1 = relay_enable_1 or [True, True, True, True]
+    enable_2 = relay_enable_2 or [False, False, False, False]
     triggers = station_triggers or {1: 0, 2: 0, 3: 0, 4: 0}
 
     state._data = {
@@ -128,6 +134,18 @@ def make_state(
         "station_2_relay":       mapping[1],
         "station_3_relay":       mapping[2],
         "station_4_relay":       mapping[3],
+        "station_1_relay_2":     mapping_2[0],
+        "station_2_relay_2":     mapping_2[1],
+        "station_3_relay_2":     mapping_2[2],
+        "station_4_relay_2":     mapping_2[3],
+        "station_1_enable_1":    enable_1[0],
+        "station_2_enable_1":    enable_1[1],
+        "station_3_enable_1":    enable_1[2],
+        "station_4_enable_1":    enable_1[3],
+        "station_1_enable_2":    enable_2[0],
+        "station_2_enable_2":    enable_2[1],
+        "station_3_enable_2":    enable_2[2],
+        "station_4_enable_2":    enable_2[3],
         "manual_test":           manual_test,
         "boot_self_test":        0,
         "hardware_coil_enabled": coil_enabled,
@@ -169,10 +187,25 @@ def run_one_cycle(worker: HardwareWorker):
     if coil_enabled or is_manual:
         for relay_ch in range(1, 5):
             for station in range(1, 5):
-                mapped_relay = int(config.get(f"station_{station}_relay", station))
-                if mapped_relay == relay_ch and station_states[station] == 1:
-                    targets[relay_ch] = 1
-                    break
+                if station_states[station] == 1:
+                    mapped_relay = config.get(f"station_{station}_relay", station)
+                    mapped_relay_2 = config.get(f"station_{station}_relay_2", None)
+                    enable_1 = config.get(f"station_{station}_enable_1", True)
+                    enable_2 = config.get(f"station_{station}_enable_2", False)
+                    
+                    try:
+                        m1 = int(mapped_relay) if mapped_relay is not None else None
+                    except (ValueError, TypeError):
+                        m1 = None
+                        
+                    try:
+                        m2 = int(mapped_relay_2) if mapped_relay_2 is not None else None
+                    except (ValueError, TypeError):
+                        m2 = None
+                        
+                    if (enable_1 and m1 == relay_ch) or (enable_2 and m2 == relay_ch):
+                        targets[relay_ch] = 1
+                        break
 
     # Phase 3 — edge-triggered serial output
     for ch in range(1, 5):
@@ -449,6 +482,80 @@ class TestORGateLogic(unittest.TestCase):
             "on_delay must not exist in SharedState — it is a client-side HMI value only")
         self.assertNotIn("off_delay", snapshot,
             "off_delay must not exist in SharedState — it is a client-side HMI value only")
+
+    # -----------------------------------------------------------------------
+    # TC-13 Dual relay assignments (Test 2)
+    # -----------------------------------------------------------------------
+    def test_13_dual_relay_assignments(self):
+        state = make_state(
+            station_triggers={1: 1, 2: 0, 3: 0, 4: 0},
+            relay_mapping=[1, 2, 3, 4],
+            relay_mapping_2=[2, None, None, None],
+            relay_enable_1=[True, True, True, True],
+            relay_enable_2=[True, False, False, False]
+        )
+        worker, ser = make_worker(state)
+        worker.last_sent_state = {1: 0, 2: 0, 3: 0, 4: 0}
+        run_one_cycle(worker)
+        self.assertIn("N1", ser.commands)
+        self.assertIn("N2", ser.commands)
+        self.assertEqual(worker.last_sent_state[1], 1)
+        self.assertEqual(worker.last_sent_state[2], 1)
+
+    # -----------------------------------------------------------------------
+    # TC-14 Relay B disabled (Test 3)
+    # -----------------------------------------------------------------------
+    def test_14_relay_b_disabled(self):
+        state = make_state(
+            station_triggers={1: 1, 2: 0, 3: 0, 4: 0},
+            relay_mapping=[1, 2, 3, 4],
+            relay_mapping_2=[2, None, None, None],
+            relay_enable_1=[True, True, True, True],
+            relay_enable_2=[False, False, False, False]
+        )
+        worker, ser = make_worker(state)
+        worker.last_sent_state = {1: 0, 2: 0, 3: 0, 4: 0}
+        run_one_cycle(worker)
+        self.assertIn("N1", ser.commands)
+        self.assertNotIn("N2", ser.commands)
+        self.assertEqual(worker.last_sent_state[1], 1)
+        self.assertEqual(worker.last_sent_state[2], 0)
+
+    # -----------------------------------------------------------------------
+    # TC-15 Dual relay duplicate assignments (Test 5)
+    # -----------------------------------------------------------------------
+    def test_15_dual_relay_duplicate_assignments(self):
+        state = make_state(
+            station_triggers={1: 1, 2: 0, 3: 0, 4: 0},
+            relay_mapping=[1, 2, 3, 4],
+            relay_mapping_2=[1, None, None, None],
+            relay_enable_1=[True, True, True, True],
+            relay_enable_2=[True, False, False, False]
+        )
+        worker, ser = make_worker(state)
+        worker.last_sent_state = {1: 0, 2: 0, 3: 0, 4: 0}
+        run_one_cycle(worker)
+        self.assertEqual(worker.last_sent_state[1], 1)
+        self.assertEqual(ser.commands.count("N1"), 1)
+
+    # -----------------------------------------------------------------------
+    # TC-16 All relay assignments disabled (Test 6)
+    # -----------------------------------------------------------------------
+    def test_16_all_relays_disabled(self):
+        state = make_state(
+            station_triggers={1: 1, 2: 1, 3: 1, 4: 1},
+            relay_mapping=[1, 2, 3, 4],
+            relay_mapping_2=[1, 2, 3, 4],
+            relay_enable_1=[False, False, False, False],
+            relay_enable_2=[False, False, False, False]
+        )
+        worker, ser = make_worker(state)
+        worker.last_sent_state = {1: 0, 2: 0, 3: 0, 4: 0}
+        run_one_cycle(worker)
+        self.assertEqual(worker.last_sent_state[1], 0)
+        self.assertEqual(worker.last_sent_state[2], 0)
+        self.assertEqual(worker.last_sent_state[3], 0)
+        self.assertEqual(worker.last_sent_state[4], 0)
 
 
 # ===========================================================================
