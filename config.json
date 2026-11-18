@@ -71,24 +71,17 @@
             2,
             1,
             2,
-            1
+            4
         ],
-        "model_path": "yolov8n.pt",
-        "confidence": 0.34,
-        "on_delay": 0.0,
-        "off_delay": 9.5,
-        "boot_self_test": 1,
-        "hardware_coil_enabled": 1,
-        "alarm_auto_reset": 19.0,
         "relay_mapping_b": [
             2,
-            0,
+            2,
             2,
             0
         ],
         "relay_a_active": [
             true,
-            true,
+            false,
             true,
             false
         ],
@@ -97,6 +90,13 @@
             false,
             false,
             false
-        ]
+        ],
+        "model_path": "yolov8n.pt",
+        "confidence": 0.31,
+        "on_delay": 0.0,
+        "off_delay": 4.0,
+        "boot_self_test": 1,
+        "hardware_coil_enabled": 1,
+        "alarm_auto_reset": 19.0
     }
 }

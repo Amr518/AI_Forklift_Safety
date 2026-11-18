@@ -83,6 +83,7 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QScroller,
     QSlider,
+    QSpinBox,
     QDoubleSpinBox,
     QCheckBox,
     QFileDialog,
@@ -103,6 +104,7 @@ from PyQt5.QtCore import (
     Qt,
     QRect,
     QEvent,
+    QObject,
     QThread,
     pyqtSignal
 )
@@ -1492,6 +1494,44 @@ class CameraCardWidget(QFrame):
 
 
 # ==========================================
+# NON-INTERACTIVE MOUSE WHEEL REDIRECT FILTER
+# ==========================================
+class NoWheelEventFilter(QObject):
+    """
+    Prevents accidental parameter changes on interactive controls (QComboBox,
+    QSpinBox, QDoubleSpinBox, QSlider) when hovering over them with mouse wheel
+    or touch scrolling gestures.
+    Instead, forwards the scroll delta directly to the parent QScrollArea so
+    the entire settings page scrolls smoothly without altering any settings.
+    """
+    def __init__(self, scroll_area, parent=None):
+        super().__init__(parent)
+        self.scroll_area = scroll_area
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel:
+            if self.scroll_area:
+                delta_y = event.angleDelta().y()
+                delta_x = event.angleDelta().x()
+                if delta_y != 0:
+                    vbar = self.scroll_area.verticalScrollBar()
+                    step = vbar.singleStep() * 3 if vbar.singleStep() > 0 else 60
+                    if delta_y > 0:
+                        vbar.setValue(vbar.value() - step)
+                    else:
+                        vbar.setValue(vbar.value() + step)
+                elif delta_x != 0:
+                    hbar = self.scroll_area.horizontalScrollBar()
+                    step = hbar.singleStep() * 3 if hbar.singleStep() > 0 else 60
+                    if delta_x > 0:
+                        hbar.setValue(hbar.value() - step)
+                    else:
+                        hbar.setValue(hbar.value() + step)
+            return True  # Consume event: never let mouse wheel alter the widget's value!
+        return super().eventFilter(obj, event)
+
+
+# ==========================================
 # MAIN OPERATIONS HMI CONSOLE (2x2 GRID)
 # ==========================================
 class ForkliftSafetyGUI(QWidget):
@@ -2421,6 +2461,12 @@ class ForkliftSafetyGUI(QWidget):
 
         self.setup_scroll.setWidget(self.setup_page)
         self.stacked_widget.addWidget(self.setup_scroll)
+
+        # Prevent mouse wheel from accidentally changing input values in the setup page
+        self._setup_wheel_filter = NoWheelEventFilter(self.setup_scroll, parent=self)
+        for widget_type in (QComboBox, QSpinBox, QDoubleSpinBox, QSlider):
+            for child in self.setup_page.findChildren(widget_type):
+                child.installEventFilter(self._setup_wheel_filter)
         # ---------------------------------------------
         # PAGE 2: HEALTH & DIAGNOSTICS (SCROLLABLE INDUSTRIAL CONSOLE)
         # ---------------------------------------------
@@ -2472,6 +2518,11 @@ class ForkliftSafetyGUI(QWidget):
         self.health_page = self.build_health_diagnostics_page()
         self.health_scroll.setWidget(self.health_page)
         self.stacked_widget.addWidget(self.health_scroll)
+
+        self._health_wheel_filter = NoWheelEventFilter(self.health_scroll, parent=self)
+        for widget_type in (QComboBox, QSpinBox, QDoubleSpinBox, QSlider):
+            for child in self.health_page.findChildren(widget_type):
+                child.installEventFilter(self._health_wheel_filter)
 
         # ---------------------------------------------
         # PAGE 3: REPORTS & EMAIL
