@@ -126,6 +126,9 @@ def load_initial_config():
         "boot_self_test":        1,
         "hardware_coil_enabled": 1,
         "relay_mapping":         [1, 2, 3, 4],
+        "relay_mapping_b":       [0, 0, 0, 0],
+        "relay_a_active":        [True, True, True, True],
+        "relay_b_active":        [False, False, False, False],
     }
     try:
         if os.path.exists(config_path):
@@ -135,8 +138,9 @@ def load_initial_config():
             for key in ["on_delay", "off_delay", "boot_self_test", "hardware_coil_enabled"]:
                 if key in settings:
                     defaults[key] = settings[key]
-            if "relay_mapping" in settings:
-                defaults["relay_mapping"] = settings["relay_mapping"]
+            for key in ["relay_mapping", "relay_mapping_b", "relay_a_active", "relay_b_active"]:
+                if key in settings:
+                    defaults[key] = settings[key]
     except Exception as e:
         print(f"[HARDWARE] Warning: Could not read config.json: {e}")
     return defaults
@@ -149,19 +153,48 @@ class SharedState:
     def __init__(self):
         self._lock  = threading.Lock()
         config      = load_initial_config()
-        mapping     = config.get("relay_mapping", [1, 2, 3, 4])
-        while len(mapping) < 4:
-            mapping.append(len(mapping) + 1)
+        mapping_a   = list(config.get("relay_mapping", [1, 2, 3, 4]))
+        while len(mapping_a) < 4:
+            mapping_a.append(len(mapping_a) + 1)
+        mapping_b   = list(config.get("relay_mapping_b", [0, 0, 0, 0]))
+        while len(mapping_b) < 4:
+            mapping_b.append(0)
+        active_a    = list(config.get("relay_a_active", [True, True, True, True]))
+        while len(active_a) < 4:
+            active_a.append(True)
+        active_b    = list(config.get("relay_b_active", [False, False, False, False]))
+        while len(active_b) < 4:
+            active_b.append(False)
 
         self._data = {
             "station_1_trigger":     0,
             "station_2_trigger":     0,
             "station_3_trigger":     0,
             "station_4_trigger":     0,
-            "station_1_relay":       mapping[0],
-            "station_2_relay":       mapping[1],
-            "station_3_relay":       mapping[2],
-            "station_4_relay":       mapping[3],
+            "station_1_relay":       mapping_a[0],
+            "station_2_relay":       mapping_a[1],
+            "station_3_relay":       mapping_a[2],
+            "station_4_relay":       mapping_a[3],
+            "station_1_relay_a":     mapping_a[0],
+            "station_2_relay_a":     mapping_a[1],
+            "station_3_relay_a":     mapping_a[2],
+            "station_4_relay_a":     mapping_a[3],
+            "station_1_relay_b":     mapping_b[0],
+            "station_2_relay_b":     mapping_b[1],
+            "station_3_relay_b":     mapping_b[2],
+            "station_4_relay_b":     mapping_b[3],
+            "station_1_active_a":    1 if active_a[0] else 0,
+            "station_2_active_a":    1 if active_a[1] else 0,
+            "station_3_active_a":    1 if active_a[2] else 0,
+            "station_4_active_a":    1 if active_a[3] else 0,
+            "station_1_active_b":    1 if active_b[0] else 0,
+            "station_2_active_b":    1 if active_b[1] else 0,
+            "station_3_active_b":    1 if active_b[2] else 0,
+            "station_4_active_b":    1 if active_b[3] else 0,
+            "manual_relay_1":        0,
+            "manual_relay_2":        0,
+            "manual_relay_3":        0,
+            "manual_relay_4":        0,
             "manual_test":           0,
             "boot_self_test":        config.get("boot_self_test", 1),
             "hardware_coil_enabled": config.get("hardware_coil_enabled", 1),
@@ -195,6 +228,7 @@ class SharedState:
         with self._lock:
             for i in range(1, 5):
                 self._data[f"station_{i}_trigger"] = 0
+                self._data[f"manual_relay_{i}"] = 0
             self._data["manual_test"] = 0
 
 
@@ -286,11 +320,22 @@ class IPCServer:
         if cmd == "trigger":
             station = msg.get("station")
             if isinstance(station, int) and 1 <= station <= 4:
-                self.state.set(f"station_{station}_trigger", int(msg.get("state", 0)))
+                val = int(msg.get("state", 0))
                 if msg.get("manual"):
-                    self.state.set("manual_test", 1)
-                elif not msg.get("any_manual_active", False):
-                    self.state.set("manual_test", 0)
+                    self.state.set(f"manual_relay_{station}", val)
+                    any_manual = any(int(self.state.get(f"manual_relay_{ch}", 0)) == 1 for ch in range(1, 5))
+                    self.state.set("manual_test", 1 if any_manual else 0)
+                else:
+                    self.state.set(f"station_{station}_trigger", val)
+            self._send_ack(client_sock, cmd, True)
+
+        elif cmd == "manual_relay":
+            relay = msg.get("relay")
+            if isinstance(relay, int) and 1 <= relay <= 4:
+                val = int(msg.get("state", 0))
+                self.state.set(f"manual_relay_{relay}", val)
+                any_manual = any(int(self.state.get(f"manual_relay_{ch}", 0)) == 1 for ch in range(1, 5))
+                self.state.set("manual_test", 1 if any_manual else 0)
             self._send_ack(client_sock, cmd, True)
 
         elif cmd == "manual_test":
@@ -311,31 +356,70 @@ class IPCServer:
             self._send_ack(client_sock, cmd, True)
 
         elif cmd == "relay_mapping":
-            mapping = msg.get("mapping", [1, 2, 3, 4])
-            updates = {
-                f"station_{i + 1}_relay": int(mapping[i])
-                for i in range(min(4, len(mapping)))
-            }
+            updates = {}
+            if "mapping_a" in msg:
+                m_a = msg["mapping_a"]
+                for i in range(min(4, len(m_a))):
+                    updates[f"station_{i + 1}_relay_a"] = int(m_a[i])
+                    updates[f"station_{i + 1}_relay"]   = int(m_a[i])
+            elif "mapping" in msg:
+                m = msg["mapping"]
+                for i in range(min(4, len(m))):
+                    updates[f"station_{i + 1}_relay_a"] = int(m[i])
+                    updates[f"station_{i + 1}_relay"]   = int(m[i])
+
+            if "mapping_b" in msg:
+                m_b = msg["mapping_b"]
+                for i in range(min(4, len(m_b))):
+                    updates[f"station_{i + 1}_relay_b"] = int(m_b[i])
+
+            if "active_a" in msg:
+                act_a = msg["active_a"]
+                for i in range(min(4, len(act_a))):
+                    updates[f"station_{i + 1}_active_a"] = 1 if act_a[i] else 0
+
+            if "active_b" in msg:
+                act_b = msg["active_b"]
+                for i in range(min(4, len(act_b))):
+                    updates[f"station_{i + 1}_active_b"] = 1 if act_b[i] else 0
+
             if updates:
                 self.state.update(updates)
             self._send_ack(client_sock, cmd, True)
 
         elif cmd == "connect":
             self.state.reset_triggers()
-            # Accept boot_self_test and hardware_coil_enabled from the connect
-            # handshake.  on_delay / off_delay are intentionally ignored here —
-            # they are client-side debounce timers, not server-side parameters.
             updates = {
                 k: msg[k] for k in
                 ["boot_self_test", "hardware_coil_enabled"]
                 if k in msg
             }
-            if "relay_mapping" in msg:
+            if "mapping_a" in msg:
+                m_a = msg["mapping_a"]
+                for i in range(min(4, len(m_a))):
+                    updates[f"station_{i + 1}_relay_a"] = int(m_a[i])
+                    updates[f"station_{i + 1}_relay"]   = int(m_a[i])
+            elif "relay_mapping" in msg:
                 mapping = msg["relay_mapping"]
-                updates.update({
-                    f"station_{i + 1}_relay": int(mapping[i])
-                    for i in range(min(4, len(mapping)))
-                })
+                for i in range(min(4, len(mapping))):
+                    updates[f"station_{i + 1}_relay_a"] = int(mapping[i])
+                    updates[f"station_{i + 1}_relay"]   = int(mapping[i])
+
+            if "mapping_b" in msg:
+                m_b = msg["mapping_b"]
+                for i in range(min(4, len(m_b))):
+                    updates[f"station_{i + 1}_relay_b"] = int(m_b[i])
+
+            if "active_a" in msg:
+                act_a = msg["active_a"]
+                for i in range(min(4, len(act_a))):
+                    updates[f"station_{i + 1}_active_a"] = 1 if act_a[i] else 0
+
+            if "active_b" in msg:
+                act_b = msg["active_b"]
+                for i in range(min(4, len(act_b))):
+                    updates[f"station_{i + 1}_active_b"] = 1 if act_b[i] else 0
+
             if updates:
                 self.state.update(updates)
             self._send_ack(client_sock, cmd, True)
@@ -570,17 +654,30 @@ class HardwareWorker:
                         station_states[station] = 1 if int(raw) == 1 else 0
 
                 # --- Phase 2: OR-reduce station states onto physical relay targets ---
-                # Relay target = 1  if ANY station mapped to that relay has state == 1
-                # Relay target = 0  ONLY when ALL mapped stations have state == 0
-                # This block is completely unchanged from the original logic.
                 targets = {1: 0, 2: 0, 3: 0, 4: 0}
+
+                # Direct manual relay tests bypass coil lock
+                for ch in range(1, 5):
+                    if int(config.get(f"manual_relay_{ch}", 0)) == 1:
+                        targets[ch] = 1
+
+                # Automated station triggers (if coil_enabled or general manual_test)
                 if coil_enabled or is_manual:
-                    for relay_ch in range(1, 5):
-                        for station in range(1, 5):
-                            mapped_relay = int(config.get(f"station_{station}_relay", station))
-                            if mapped_relay == relay_ch and station_states[station] == 1:
-                                targets[relay_ch] = 1
-                                break  # OR satisfied — no need to check remaining stations
+                    for station in range(1, 5):
+                        if station_states[station] == 1:
+                            # Relay A routing
+                            act_a = int(config.get(f"station_{station}_active_a", 1)) == 1
+                            if act_a:
+                                rel_a = int(config.get(f"station_{station}_relay_a", config.get(f"station_{station}_relay", station)))
+                                if 1 <= rel_a <= 4:
+                                    targets[rel_a] = 1
+
+                            # Relay B routing
+                            act_b = int(config.get(f"station_{station}_active_b", 0)) == 1
+                            if act_b:
+                                rel_b = int(config.get(f"station_{station}_relay_b", 0))
+                                if 1 <= rel_b <= 4:
+                                    targets[rel_b] = 1
 
                 # --- Phase 3: Edge-triggered output + heartbeat retransmission ---
                 #

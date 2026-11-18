@@ -106,6 +106,10 @@ HardwareWorker = _hw_mod.HardwareWorker
 def make_state(
     station_triggers: dict = None,
     relay_mapping:    list  = None,
+    relay_mapping_b:  list  = None,
+    active_a:         list  = None,
+    active_b:         list  = None,
+    manual_relays:    dict  = None,
     coil_enabled:     int   = 1,
     manual_test:      int   = 0,
 ) -> SharedState:
@@ -116,8 +120,12 @@ def make_state(
     state = SharedState.__new__(SharedState)
     state._lock = threading.Lock()
 
-    mapping = relay_mapping or [1, 2, 3, 4]
-    triggers = station_triggers or {1: 0, 2: 0, 3: 0, 4: 0}
+    mapping   = relay_mapping or [1, 2, 3, 4]
+    mapping_b = relay_mapping_b or [0, 0, 0, 0]
+    act_a     = active_a if active_a is not None else [True, True, True, True]
+    act_b     = active_b if active_b is not None else [False, False, False, False]
+    triggers  = station_triggers or {1: 0, 2: 0, 3: 0, 4: 0}
+    man_rel   = manual_relays or {}
 
     state._data = {
         "station_1_trigger":     triggers.get(1, 0),
@@ -128,7 +136,27 @@ def make_state(
         "station_2_relay":       mapping[1],
         "station_3_relay":       mapping[2],
         "station_4_relay":       mapping[3],
-        "manual_test":           manual_test,
+        "station_1_relay_a":     mapping[0],
+        "station_2_relay_a":     mapping[1],
+        "station_3_relay_a":     mapping[2],
+        "station_4_relay_a":     mapping[3],
+        "station_1_relay_b":     mapping_b[0],
+        "station_2_relay_b":     mapping_b[1],
+        "station_3_relay_b":     mapping_b[2],
+        "station_4_relay_b":     mapping_b[3],
+        "station_1_active_a":    1 if act_a[0] else 0,
+        "station_2_active_a":    1 if act_a[1] else 0,
+        "station_3_active_a":    1 if act_a[2] else 0,
+        "station_4_active_a":    1 if act_a[3] else 0,
+        "station_1_active_b":    1 if act_b[0] else 0,
+        "station_2_active_b":    1 if act_b[1] else 0,
+        "station_3_active_b":    1 if act_b[2] else 0,
+        "station_4_active_b":    1 if act_b[3] else 0,
+        "manual_relay_1":        man_rel.get(1, 0),
+        "manual_relay_2":        man_rel.get(2, 0),
+        "manual_relay_3":        man_rel.get(3, 0),
+        "manual_relay_4":        man_rel.get(4, 0),
+        "manual_test":           manual_test or (1 if any(man_rel.values()) else 0),
         "boot_self_test":        0,
         "hardware_coil_enabled": coil_enabled,
         "hw_status":             "ONLINE",
@@ -166,13 +194,29 @@ def run_one_cycle(worker: HardwareWorker):
 
     # Phase 2 — OR reduction
     targets = {1: 0, 2: 0, 3: 0, 4: 0}
+
+    # Direct manual relay tests bypass coil lock
+    for ch in range(1, 5):
+        if int(config.get(f"manual_relay_{ch}", 0)) == 1:
+            targets[ch] = 1
+
+    # Automated station triggers (if coil_enabled or general manual_test)
     if coil_enabled or is_manual:
-        for relay_ch in range(1, 5):
-            for station in range(1, 5):
-                mapped_relay = int(config.get(f"station_{station}_relay", station))
-                if mapped_relay == relay_ch and station_states[station] == 1:
-                    targets[relay_ch] = 1
-                    break
+        for station in range(1, 5):
+            if station_states[station] == 1:
+                # Relay A routing
+                act_a = int(config.get(f"station_{station}_active_a", 1)) == 1
+                if act_a:
+                    rel_a = int(config.get(f"station_{station}_relay_a", config.get(f"station_{station}_relay", station)))
+                    if 1 <= rel_a <= 4:
+                        targets[rel_a] = 1
+
+                # Relay B routing
+                act_b = int(config.get(f"station_{station}_active_b", 0)) == 1
+                if act_b:
+                    rel_b = int(config.get(f"station_{station}_relay_b", 0))
+                    if 1 <= rel_b <= 4:
+                        targets[rel_b] = 1
 
     # Phase 3 — edge-triggered serial output
     for ch in range(1, 5):
@@ -449,6 +493,77 @@ class TestORGateLogic(unittest.TestCase):
             "on_delay must not exist in SharedState — it is a client-side HMI value only")
         self.assertNotIn("off_delay", snapshot,
             "off_delay must not exist in SharedState — it is a client-side HMI value only")
+
+    # -----------------------------------------------------------------------
+    # TC-13  Station inactive (Active A=False, Active B=False) does NOT fire
+    # -----------------------------------------------------------------------
+    def test_13_station_inactive_does_not_fire_relay(self):
+        state = make_state(
+            station_triggers={1: 1, 2: 0, 3: 0, 4: 0},
+            relay_mapping=[1, 2, 3, 4],
+            active_a=[False, True, True, True],
+            active_b=[False, False, False, False],
+        )
+        worker, ser = make_worker(state)
+        worker.last_sent_state = {1: 0, 2: 0, 3: 0, 4: 0}
+        run_one_cycle(worker)
+
+        self.assertNotIn("N1", ser.commands,
+            "Station 1 with Active A=False must NOT fire Relay 1")
+        self.assertEqual(worker.last_sent_state[1], 0)
+
+    # -----------------------------------------------------------------------
+    # TC-14  Station mapped to Relay 2 fires Relay 2, NOT Relay 1
+    # -----------------------------------------------------------------------
+    def test_14_station_mapped_to_relay_2_fires_relay_2_only(self):
+        state = make_state(
+            station_triggers={1: 1, 2: 0, 3: 0, 4: 0},
+            relay_mapping=[2, 1, 2, 1],
+            active_a=[True, True, True, False],
+        )
+        worker, ser = make_worker(state)
+        worker.last_sent_state = {1: 0, 2: 0, 3: 0, 4: 0}
+        run_one_cycle(worker)
+
+        self.assertIn("N2", ser.commands,
+            "Station 1 mapped to Relay 2 must transmit N2")
+        self.assertNotIn("N1", ser.commands,
+            "Station 1 mapped to Relay 2 must NOT transmit N1")
+
+    # -----------------------------------------------------------------------
+    # TC-15  Dual relay mapping (A=1 active, B=3 active) fires both relays
+    # -----------------------------------------------------------------------
+    def test_15_dual_relay_mapping_fires_both(self):
+        state = make_state(
+            station_triggers={1: 1, 2: 0, 3: 0, 4: 0},
+            relay_mapping=[1, 2, 3, 4],
+            relay_mapping_b=[3, 0, 0, 0],
+            active_a=[True, True, True, True],
+            active_b=[True, False, False, False],
+        )
+        worker, ser = make_worker(state)
+        worker.last_sent_state = {1: 0, 2: 0, 3: 0, 4: 0}
+        run_one_cycle(worker)
+
+        self.assertIn("N1", ser.commands, "Relay A (1) must fire")
+        self.assertIn("N3", ser.commands, "Relay B (3) must fire")
+
+    # -----------------------------------------------------------------------
+    # TC-16  Direct manual relay test bypasses coil lock and fires physical relay
+    # -----------------------------------------------------------------------
+    def test_16_manual_relay_override_fires_direct_channel(self):
+        state = make_state(
+            station_triggers={1: 0, 2: 0, 3: 0, 4: 0},
+            manual_relays={2: 1},
+            coil_enabled=0,
+        )
+        worker, ser = make_worker(state)
+        worker.last_sent_state = {1: 0, 2: 0, 3: 0, 4: 0}
+        run_one_cycle(worker)
+
+        self.assertIn("N2", ser.commands,
+            "Manual direct relay test must fire physical Relay 2 even when coil_enabled=0")
+        self.assertNotIn("N1", ser.commands)
 
 
 # ===========================================================================

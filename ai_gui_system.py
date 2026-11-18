@@ -1384,10 +1384,20 @@ class CameraCardWidget(QFrame):
                         self.last_hardware_state = warning
                         if "Filtered" not in msg and "Cooldown" not in msg:
                             if self.parent_window:
+                                targets_list = []
+                                cfg = self.parent_window.global_settings
+                                act_a = cfg.get("relay_a_active", [True, True, True, True])
+                                act_b = cfg.get("relay_b_active", [False, False, False, False])
+                                map_a = cfg.get("relay_mapping", [1, 2, 3, 4])
+                                map_b = cfg.get("relay_mapping_b", [0, 0, 0, 0])
+                                if self.cam_id < len(act_a) and act_a[self.cam_id] and self.cam_id < len(map_a) and 1 <= map_a[self.cam_id] <= 4:
+                                    targets_list.append(f"R{map_a[self.cam_id]}")
+                                if self.cam_id < len(act_b) and act_b[self.cam_id] and self.cam_id < len(map_b) and 1 <= map_b[self.cam_id] <= 4:
+                                    targets_list.append(f"R{map_b[self.cam_id]}")
+                                target_str = "+".join(targets_list) if targets_list else "None (Inactive)"
                                 log_type = "warning" if warning else "success"
-                                action_char = 'N' if warning else 'F'
                                 self.parent_window.add_audit_log(
-                                    f"RM04U: Ch {self.cam_id + 1} -> {'ON' if warning else 'OFF'} ({action_char}{self.cam_id + 1}) - {msg}", 
+                                    f"Station {self.cam_id + 1} -> {'ALERT' if warning else 'CLEAR'} (Target: {target_str}) - {msg}", 
                                     log_type
                                 )
 
@@ -1530,6 +1540,22 @@ class ForkliftSafetyGUI(QWidget):
         
         # Instantiate modular USB Serial Relay Manager
         self.relay_manager = USBRelayManager()
+        self.relay_manager.update_delay_config(
+            self.global_settings.get("on_delay", 0.2),
+            self.global_settings.get("off_delay", 1.5)
+        )
+        self.relay_manager.update_boot_self_test(
+            self.global_settings.get("boot_self_test", 1) == 1
+        )
+        self.relay_manager.set_hardware_coil_enabled(
+            self.global_settings.get("hardware_coil_enabled", 1) == 1
+        )
+        self.relay_manager.update_relay_config(
+            mapping_a=self.global_settings.get("relay_mapping", [1, 2, 3, 4]),
+            mapping_b=self.global_settings.get("relay_mapping_b", [0, 0, 0, 0]),
+            active_a=self.global_settings.get("relay_a_active", [True, True, True, True]),
+            active_b=self.global_settings.get("relay_b_active", [False, False, False, False]),
+        )
         
         # Set Window Title
         self.setWindowTitle("LIMITLESS FUTURE - FORKLIFT HUMAN DETECTION SAFETY SYSTEM")
@@ -2116,6 +2142,8 @@ class ForkliftSafetyGUI(QWidget):
 
         default_mapping_a = self.global_settings.get("relay_mapping", [1, 1, 1, 1])
         default_mapping_b = self.global_settings.get("relay_mapping_b", [2, 0, 4, 4])
+        default_act_a     = self.global_settings.get("relay_a_active", [True, True, True, True])
+        default_act_b     = self.global_settings.get("relay_b_active", [False, False, False, False])
         default_nodes = ["/dev/video0", "/dev/video2", "/dev/video4", "6"]
         relay_options = ["Relay 1", "Relay 2", "Relay 3", "Relay 4", "None"]
 
@@ -2224,10 +2252,11 @@ class ForkliftSafetyGUI(QWidget):
             sub_layout.addWidget(combo_a, 4, 1)
             self.relay_a_dropdowns.append(combo_a)
 
-            btn_act_a = QPushButton("✓  Active")
+            act_a = default_act_a[i] if i < len(default_act_a) else True
+            btn_act_a = QPushButton("✓  Active" if act_a else "   Active")
             btn_act_a.setCheckable(True)
-            btn_act_a.setChecked(True)
-            btn_act_a.setStyleSheet("QPushButton { background: transparent; border: none; color: #ffffff; font-family: 'Segoe UI Semibold'; font-size: 11px; font-weight: bold; text-transform: none; text-align: left; padding: 2px 4px; } QPushButton:hover { color: #63b3ed; }")
+            btn_act_a.setChecked(act_a)
+            btn_act_a.setStyleSheet(f"QPushButton {{ background: transparent; border: none; color: {'#ffffff' if act_a else '#718096'}; font-family: 'Segoe UI Semibold'; font-size: 11px; font-weight: bold; text-transform: none; text-align: left; padding: 2px 4px; }} QPushButton:hover {{ color: #63b3ed; }}")
             btn_act_a.clicked.connect(create_toggle_act(btn_act_a))
             sub_layout.addWidget(btn_act_a, 4, 2)
             self.relay_a_active_checks.append(btn_act_a)
@@ -2246,10 +2275,11 @@ class ForkliftSafetyGUI(QWidget):
             sub_layout.addWidget(combo_b, 5, 1)
             self.relay_b_dropdowns.append(combo_b)
 
-            btn_act_b = QPushButton("   Active")
+            act_b = default_act_b[i] if i < len(default_act_b) else False
+            btn_act_b = QPushButton("✓  Active" if act_b else "   Active")
             btn_act_b.setCheckable(True)
-            btn_act_b.setChecked(False)
-            btn_act_b.setStyleSheet("QPushButton { background: transparent; border: none; color: #718096; font-family: 'Segoe UI Semibold'; font-size: 11px; font-weight: bold; text-transform: none; text-align: left; padding: 2px 4px; } QPushButton:hover { color: #cbd5e0; }")
+            btn_act_b.setChecked(act_b)
+            btn_act_b.setStyleSheet(f"QPushButton {{ background: transparent; border: none; color: {'#ffffff' if act_b else '#718096'}; font-family: 'Segoe UI Semibold'; font-size: 11px; font-weight: bold; text-transform: none; text-align: left; padding: 2px 4px; }} QPushButton:hover {{ color: #cbd5e0; }}")
             btn_act_b.clicked.connect(create_toggle_act(btn_act_b))
             sub_layout.addWidget(btn_act_b, 5, 2)
             self.relay_b_active_checks.append(btn_act_b)
@@ -3972,6 +4002,9 @@ class ForkliftSafetyGUI(QWidget):
             "camera_physical_paths": list(DEFAULT_PHYSICAL_PATHS),
             "cameras_enabled": [True, True, True, True],
             "relay_mapping": [1, 2, 3, 4],
+            "relay_mapping_b": [0, 0, 0, 0],
+            "relay_a_active": [True, True, True, True],
+            "relay_b_active": [False, False, False, False],
             "model_path": "yolov8n.pt",
             "confidence": 0.25,
             "on_delay": 0.2,
@@ -4106,8 +4139,11 @@ class ForkliftSafetyGUI(QWidget):
                 self.relay_manager.update_boot_self_test(
                     self.global_settings["boot_self_test"] == 1
                 )
-                self.relay_manager.update_relay_mapping(
-                    self.global_settings["relay_mapping"]
+                self.relay_manager.update_relay_config(
+                    mapping_a=self.global_settings["relay_mapping"],
+                    mapping_b=self.global_settings.get("relay_mapping_b", [0, 0, 0, 0]),
+                    active_a=self.global_settings.get("relay_a_active", [True, True, True, True]),
+                    active_b=self.global_settings.get("relay_b_active", [False, False, False, False]),
                 )
                 self.relay_manager.set_hardware_coil_enabled(
                     self.global_settings["hardware_coil_enabled"] == 1
@@ -4200,8 +4236,11 @@ class ForkliftSafetyGUI(QWidget):
             self.relay_manager.update_boot_self_test(
                 self.global_settings["boot_self_test"] == 1
             )
-            self.relay_manager.update_relay_mapping(
-                self.global_settings["relay_mapping"]
+            self.relay_manager.update_relay_config(
+                mapping_a=self.global_settings["relay_mapping"],
+                mapping_b=self.global_settings.get("relay_mapping_b", [0, 0, 0, 0]),
+                active_a=self.global_settings.get("relay_a_active", [True, True, True, True]),
+                active_b=self.global_settings.get("relay_b_active", [False, False, False, False]),
             )
             self.relay_manager.set_hardware_coil_enabled(
                 self.global_settings["hardware_coil_enabled"] == 1
@@ -4278,7 +4317,7 @@ class ForkliftSafetyGUI(QWidget):
                 self.relay_manager.manual_overrides[index] = checked
         
         if self.relay_manager.is_connected:
-            success, msg = self.relay_manager.trigger_relay(index, checked, force=True)
+            success, msg = self.relay_manager.test_physical_relay(index + 1, checked)
             if success:
                 self.add_audit_log(f"RM04U Manual Override: Relay {index + 1} set to {state_str} ({action_char}{index + 1}) - {msg}.", color)
             else:

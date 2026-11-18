@@ -56,6 +56,10 @@ class USBRelayManager:
         self.boot_self_test        = 1
         self.hardware_coil_enabled = 1
         self.manual_overrides      = [False, False, False, False]
+        self.relay_mapping_a       = [1, 2, 3, 4]
+        self.relay_mapping_b       = [0, 0, 0, 0]
+        self.relay_a_active        = [True, True, True, True]
+        self.relay_b_active        = [False, False, False, False]
 
         self._socket       = None
         self._socket_lock  = threading.Lock()
@@ -233,6 +237,11 @@ class USBRelayManager:
             "off_delay":             self.off_delay,
             "boot_self_test":        self.boot_self_test,
             "hardware_coil_enabled": self.hardware_coil_enabled,
+            "mapping_a":             self.relay_mapping_a,
+            "mapping_b":             self.relay_mapping_b,
+            "active_a":              self.relay_a_active,
+            "active_b":              self.relay_b_active,
+            "relay_mapping":         self.relay_mapping_a,
         })
 
         print(f"[USBRelayManager] IPC mode: target port set to {port_name}")
@@ -347,19 +356,61 @@ class USBRelayManager:
     # DYNAMIC RELAY MAPPING
     # ==========================================
 
+    def update_relay_config(self, mapping_a=None, mapping_b=None, active_a=None, active_b=None):
+        """
+        Updates the complete station-to-relay mapping (Relay A and Relay B)
+        and active flags via socket IPC.
+        """
+        if mapping_a is not None:
+            self.relay_mapping_a = [int(m) for m in mapping_a]
+        if mapping_b is not None:
+            self.relay_mapping_b = [int(m) for m in mapping_b]
+        if active_a is not None:
+            self.relay_a_active  = [bool(a) for a in active_a]
+        if active_b is not None:
+            self.relay_b_active  = [bool(b) for b in active_b]
+
+        self._send_command({
+            "cmd":       "relay_mapping",
+            "mapping_a": self.relay_mapping_a,
+            "mapping_b": self.relay_mapping_b,
+            "active_a":  self.relay_a_active,
+            "active_b":  self.relay_b_active,
+            "mapping":   self.relay_mapping_a,
+        })
+        print(f"[USBRelayManager] Relay config updated: A={self.relay_mapping_a} (act={self.relay_a_active}), "
+              f"B={self.relay_mapping_b} (act={self.relay_b_active})")
+
     def update_relay_mapping(self, mapping_list):
         """
-        Updates the station-to-relay mapping via socket.
-
-        Args:
-            mapping_list: list of ints [relay_for_st1, relay_for_st2,
-                                        relay_for_st3, relay_for_st4]
+        Legacy alias: updates Relay A mapping via socket.
         """
-        self._send_command({
-            "cmd":     "relay_mapping",
-            "mapping": [int(m) for m in mapping_list],
-        })
-        print(f"[USBRelayManager] Relay mapping updated: {mapping_list}")
+        self.update_relay_config(mapping_a=mapping_list)
+
+    def test_physical_relay(self, relay_channel, state):
+        """
+        Directly test a physical relay channel (1-4) for manual diagnostics.
+        Bypasses station routing so TEST R1 always tests physical Relay 1.
+        """
+        try:
+            ch = int(relay_channel)
+        except (ValueError, TypeError):
+            return False, f"Invalid relay_channel: {relay_channel}"
+
+        if not 1 <= ch <= 4:
+            return False, f"Relay channel out of range: {ch}"
+
+        cmd = {
+            "cmd":   "manual_relay",
+            "relay": ch,
+            "state": 1 if state else 0,
+        }
+        success = self._send_command(cmd)
+        cmd_str = f"{'N' if state else 'F'}{ch}"
+        if success:
+            print(f"[USBRelayManager] Manual physical test: Relay {ch} -> {'ON' if state else 'OFF'} ({cmd_str})")
+            return True, f"Manual: {cmd_str} -> {'ON' if state else 'OFF'}"
+        return False, "IPC send failed"
 
     # ==========================================
     # LIFECYCLE CLEANUP
