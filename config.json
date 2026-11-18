@@ -20,7 +20,6 @@
         "y": 88,
         "w": 353,
         "h": 164,
-        "physical_usb_path": "1-5",
         "enabled": true
     },
     "camera_2": {
@@ -58,7 +57,7 @@
         ],
         "camera_physical_paths": [
             "1-1",
-            "1-5",
+            null,
             "1-2",
             "1-4"
         ],
@@ -70,28 +69,28 @@
         ],
         "relay_mapping": [
             2,
-            1,
-            1,
-            2
+            2,
+            2,
+            1
         ],
         "model_path": "yolov8n.pt",
         "confidence": 0.34,
-        "on_delay": 0.2,
-        "off_delay": 10.0,
+        "on_delay": 0.4,
+        "off_delay": 9.5,
         "boot_self_test": 1,
         "hardware_coil_enabled": 1,
-        "alarm_auto_reset": 20.0,
+        "alarm_auto_reset": 19.0,
         "relay_mapping_b": [
-            1,
-            1,
-            1,
-            1
+            2,
+            0,
+            2,
+            4
         ],
         "relay_a_active": [
             true,
             true,
             true,
-            true
+            false
         ],
         "relay_b_active": [
             false,

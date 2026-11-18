@@ -2192,7 +2192,6 @@ class ForkliftSafetyGUI(QWidget):
                     background-color: #1a202c; color: #ffffff; selection-background-color: #2b6cb0;
                 }
             """)
-            port_combo.currentIndexChanged.connect(lambda _, s=i: self.on_camera_port_reassigned(s))
             sub_layout.addWidget(port_combo, 1, 0, 1, 3)
             self.cam_port_dropdowns.append(port_combo)
 
