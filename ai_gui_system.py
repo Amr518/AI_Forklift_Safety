@@ -81,6 +81,7 @@ from PyQt5.QtWidgets import (
     QStackedWidget,
     QGroupBox,
     QScrollArea,
+    QScroller,
     QSlider,
     QDoubleSpinBox,
     QCheckBox,
@@ -1815,7 +1816,7 @@ class ForkliftSafetyGUI(QWidget):
         # ---------------------------------------------
         self.setup_scroll = QScrollArea()
         self.setup_scroll.setWidgetResizable(True)
-        self.setup_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setup_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setup_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setup_scroll.setStyleSheet("""
             QScrollArea {
@@ -1823,18 +1824,18 @@ class ForkliftSafetyGUI(QWidget):
                 border: none;
             }
             QScrollBar:vertical {
-                background: transparent;
-                width: 8px;
+                background: #12151c;
+                width: 10px;
                 margin: 0px;
-                border-radius: 4px;
+                border-radius: 5px;
             }
             QScrollBar::handle:vertical {
                 background: #4a5568;
                 min-height: 40px;
-                border-radius: 4px;
+                border-radius: 5px;
             }
             QScrollBar::handle:vertical:hover {
-                background: #718096;
+                background: #3182ce;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0px;
@@ -1843,7 +1844,29 @@ class ForkliftSafetyGUI(QWidget):
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
                 background: transparent;
             }
+            QScrollBar:horizontal {
+                background: #12151c;
+                height: 14px;
+                margin: 0px;
+                border-radius: 7px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #4a5568;
+                min-width: 50px;
+                border-radius: 7px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #3182ce;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+                background: none;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: transparent;
+            }
         """)
+        QScroller.grabGesture(self.setup_scroll.viewport(), QScroller.LeftMouseButtonGesture)
 
         self.setup_page = QWidget()
         self.setup_page.setStyleSheet("""
@@ -2009,13 +2032,13 @@ class ForkliftSafetyGUI(QWidget):
         relay_layout.addWidget(self.btn_test_conn, 1, 0, 1, 2)
 
         test_btns_layout = QHBoxLayout()
-        test_btns_layout.setSpacing(6)
+        test_btns_layout.setSpacing(4)
         self.relay_buttons = []
         for i in range(4):
-            btn = QPushButton(f"TEST RELAY {i+1}")
+            btn = QPushButton(f"TEST R{i+1}")
             btn.setCheckable(True)
             btn.setStyleSheet("""
-                QPushButton { background-color: #1e242f; border: 1px solid #2d3846; font-size: 10px; font-weight: bold; text-transform: uppercase; padding: 5px 10px; color: #cbd5e0; border-radius: 4px; }
+                QPushButton { background-color: #1e242f; border: 1px solid #2d3846; font-size: 10px; font-weight: bold; text-transform: uppercase; padding: 5px 6px; color: #cbd5e0; border-radius: 4px; }
                 QPushButton:hover { background-color: #2b3545; color: #ffffff; }
                 QPushButton:checked { background-color: #c53030; border: 1px solid #e53e3e; color: #ffffff; }
             """)
@@ -2135,8 +2158,28 @@ class ForkliftSafetyGUI(QWidget):
             sub_layout.setColumnStretch(1, 1)
             sub_layout.setColumnStretch(2, 0)
 
-            # Row 0: USB Port / Camera Selection Dropdown + Lock Button
-            sub_layout.addWidget(QLabel("USB Port / Camera:"), 0, 0)
+            # Row 0: USB Port / Camera Label + Lock Button (Header)
+            row0_hdr = QWidget()
+            row0_hdr_layout = QHBoxLayout(row0_hdr)
+            row0_hdr_layout.setContentsMargins(0, 0, 0, 0)
+            row0_hdr_layout.addWidget(QLabel("USB Port / Camera:"))
+            row0_hdr_layout.addStretch()
+
+            btn_lock = QPushButton("🔒 LOCK PORT")
+            btn_lock.setToolTip("Lock this physical USB port to this display viewport to prevent camera swapping during vibrations.")
+            btn_lock.setStyleSheet("""
+                QPushButton {
+                    background-color: #1e3a2b; border: 1px solid #2f855a; color: #48bb78;
+                    font-family: 'Segoe UI Semibold'; font-size: 10px; font-weight: bold; border-radius: 4px; padding: 3px 8px;
+                }
+                QPushButton:hover { background-color: #276749; color: #ffffff; }
+            """)
+            btn_lock.clicked.connect(lambda _, s=i: self.on_camera_port_reassigned(s))
+            row0_hdr_layout.addWidget(btn_lock)
+            self.cam_port_lock_buttons.append(btn_lock)
+            sub_layout.addWidget(row0_hdr, 0, 0, 1, 3)
+
+            # Row 1: Full-Width USB Port / Camera Selection Dropdown
             port_combo = QComboBox()
             port_combo.setView(QListView())
             port_combo.setStyleSheet("""
@@ -2150,39 +2193,26 @@ class ForkliftSafetyGUI(QWidget):
                 }
             """)
             port_combo.currentIndexChanged.connect(lambda _, s=i: self.on_camera_port_reassigned(s))
-            sub_layout.addWidget(port_combo, 0, 1)
+            sub_layout.addWidget(port_combo, 1, 0, 1, 3)
             self.cam_port_dropdowns.append(port_combo)
 
-            btn_lock = QPushButton("LOCK PORT")
-            btn_lock.setToolTip("Lock this physical USB port to this display viewport to prevent camera swapping during vibrations.")
-            btn_lock.setStyleSheet("""
-                QPushButton {
-                    background-color: #1e3a2b; border: 1px solid #2f855a; color: #48bb78;
-                    font-family: 'Segoe UI Semibold'; font-size: 10px; font-weight: bold; border-radius: 4px; padding: 4px 8px;
-                }
-                QPushButton:hover { background-color: #276749; color: #ffffff; }
-            """)
-            btn_lock.clicked.connect(lambda _, s=i: self.on_camera_port_reassigned(s))
-            sub_layout.addWidget(btn_lock, 0, 2)
-            self.cam_port_lock_buttons.append(btn_lock)
-
-            # Row 1: Hardware Binding Status Badge
+            # Row 2: Hardware Binding Status Badge
             lbl_status = QLabel("NOT BOUND")
             lbl_status.setStyleSheet("color: #a0aec0; font-family: 'Segoe UI Semibold'; font-size: 10px;")
-            sub_layout.addWidget(QLabel("Binding Status:"), 1, 0)
-            sub_layout.addWidget(lbl_status, 1, 1, 1, 2)
+            sub_layout.addWidget(QLabel("Binding Status:"), 2, 0)
+            sub_layout.addWidget(lbl_status, 2, 1, 1, 2)
             self.cam_bind_status_labels.append(lbl_status)
 
-            # Row 2: Active Device Node
-            sub_layout.addWidget(QLabel("Device Node:"), 2, 0)
+            # Row 3: Active Device Node
+            sub_layout.addWidget(QLabel("Device Node:"), 3, 0)
             dev_text = default_nodes[i] if i < len(default_nodes) else f"/dev/video{i*2}"
             lbl_dev = QLabel(dev_text)
             lbl_dev.setStyleSheet("color: #63b3ed; font-family: 'Segoe UI Semibold', monospace; font-size: 11px; font-weight: bold;")
-            sub_layout.addWidget(lbl_dev, 2, 1, 1, 2)
+            sub_layout.addWidget(lbl_dev, 3, 1, 1, 2)
             self.cam_node_labels.append(lbl_dev)
 
-            # Row 3: Relay A
-            sub_layout.addWidget(QLabel("Relay A:"), 3, 0)
+            # Row 4: Relay A
+            sub_layout.addWidget(QLabel("Relay A:"), 4, 0)
             combo_a = QComboBox()
             combo_a.setView(QListView())
             combo_a.addItems(relay_options)
@@ -2192,7 +2222,7 @@ class ForkliftSafetyGUI(QWidget):
             else:
                 combo_a.setCurrentIndex(4)
             combo_a.currentIndexChanged.connect(self.instant_save_timer_config)
-            sub_layout.addWidget(combo_a, 3, 1)
+            sub_layout.addWidget(combo_a, 4, 1)
             self.relay_a_dropdowns.append(combo_a)
 
             btn_act_a = QPushButton("✓  Active")
@@ -2200,11 +2230,11 @@ class ForkliftSafetyGUI(QWidget):
             btn_act_a.setChecked(True)
             btn_act_a.setStyleSheet("QPushButton { background: transparent; border: none; color: #ffffff; font-family: 'Segoe UI Semibold'; font-size: 11px; font-weight: bold; text-transform: none; text-align: left; padding: 2px 4px; } QPushButton:hover { color: #63b3ed; }")
             btn_act_a.clicked.connect(create_toggle_act(btn_act_a))
-            sub_layout.addWidget(btn_act_a, 3, 2)
+            sub_layout.addWidget(btn_act_a, 4, 2)
             self.relay_a_active_checks.append(btn_act_a)
 
-            # Row 4: Relay B
-            sub_layout.addWidget(QLabel("Relay B:"), 4, 0)
+            # Row 5: Relay B
+            sub_layout.addWidget(QLabel("Relay B:"), 5, 0)
             combo_b = QComboBox()
             combo_b.setView(QListView())
             combo_b.addItems(relay_options)
@@ -2214,7 +2244,7 @@ class ForkliftSafetyGUI(QWidget):
             else:
                 combo_b.setCurrentIndex(4)
             combo_b.currentIndexChanged.connect(self.instant_save_timer_config)
-            sub_layout.addWidget(combo_b, 4, 1)
+            sub_layout.addWidget(combo_b, 5, 1)
             self.relay_b_dropdowns.append(combo_b)
 
             btn_act_b = QPushButton("   Active")
@@ -2222,7 +2252,7 @@ class ForkliftSafetyGUI(QWidget):
             btn_act_b.setChecked(False)
             btn_act_b.setStyleSheet("QPushButton { background: transparent; border: none; color: #718096; font-family: 'Segoe UI Semibold'; font-size: 11px; font-weight: bold; text-transform: none; text-align: left; padding: 2px 4px; } QPushButton:hover { color: #cbd5e0; }")
             btn_act_b.clicked.connect(create_toggle_act(btn_act_b))
-            sub_layout.addWidget(btn_act_b, 4, 2)
+            sub_layout.addWidget(btn_act_b, 5, 2)
             self.relay_b_active_checks.append(btn_act_b)
 
             row = i // 2
@@ -2367,7 +2397,7 @@ class ForkliftSafetyGUI(QWidget):
         # ---------------------------------------------
         self.health_scroll = QScrollArea()
         self.health_scroll.setWidgetResizable(True)
-        self.health_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.health_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.health_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.health_scroll.setStyleSheet("""
             QScrollArea {
@@ -2378,12 +2408,12 @@ class ForkliftSafetyGUI(QWidget):
                 background: #111620;
                 width: 10px;
                 margin: 0px;
-                border-radius: 4px;
+                border-radius: 5px;
             }
             QScrollBar::handle:vertical {
                 background: #2b3548;
                 min-height: 25px;
-                border-radius: 4px;
+                border-radius: 5px;
             }
             QScrollBar::handle:vertical:hover {
                 background: #3b82f6;
@@ -2391,7 +2421,25 @@ class ForkliftSafetyGUI(QWidget):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0px;
             }
+            QScrollBar:horizontal {
+                background: #111620;
+                height: 14px;
+                margin: 0px;
+                border-radius: 7px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #2b3548;
+                min-width: 50px;
+                border-radius: 7px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #3b82f6;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
         """)
+        QScroller.grabGesture(self.health_scroll.viewport(), QScroller.LeftMouseButtonGesture)
         self.health_page = self.build_health_diagnostics_page()
         self.health_scroll.setWidget(self.health_page)
         self.stacked_widget.addWidget(self.health_scroll)
