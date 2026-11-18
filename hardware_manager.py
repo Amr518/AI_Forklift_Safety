@@ -25,18 +25,11 @@ IPC Protocol (JSON-over-newline):
 ============================================================
 """
 
-import os
 import json
 import time
 import glob
 import socket
 import threading
-
-try:
-    import serial.tools.list_ports
-    HAS_SERIAL = True
-except ImportError:
-    HAS_SERIAL = False
 
 SOCKET_PATH       = "/dev/shm/forklift_relay.sock"
 DEFAULT_ON_DELAY  = 0.2

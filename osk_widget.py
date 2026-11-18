@@ -193,12 +193,6 @@ class OSKKey(QPushButton):
         elif self.action == '__CAPS__':
             self._apply_style("caps_on" if active else "caps_off")
 
-    def set_shift_active(self, active: bool):
-        self.set_active(active)
-
-    def set_type(self, key_type: str):
-        self._apply_style(key_type)
-
 
 # ============================================================
 # MAIN OSK WIDGET (CLASSIC KEYBOARD)

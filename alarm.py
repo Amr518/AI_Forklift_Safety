@@ -1,4 +1,4 @@
-from PyQt5.QtCore import QPoint, QRect
+from PyQt5.QtCore import QPoint
 
 class AlarmSystem:
     """
@@ -36,38 +36,3 @@ class AlarmSystem:
         """
         return self.evaluate_safety(persons, roi_rect)
 
-    def get_status_styles(self, warning):
-        """
-        Returns the appropriate text and stylesheet for the GUI status label based on current safety.
-        Args:
-            warning (bool): True if warning is active.
-        Returns:
-            tuple: (status_text, stylesheet_string)
-        """
-        if warning:
-            text = "WARNING !!! PERSON DETECTED"
-            stylesheet = """
-                font-size: 22px;
-                color: #FF3B30;
-                font-weight: bold;
-            """
-        else:
-            text = "SYSTEM SAFE"
-            stylesheet = """
-                font-size: 22px;
-                color: #34C759;
-                font-weight: bold;
-            """
-        return text, stylesheet
-
-    def get_camera_error_styles(self):
-        """
-        Returns the status text and styling specifically for camera error or disconnection states.
-        """
-        text = "⚠️ CAMERA ERROR / DISCONNECTED"
-        stylesheet = """
-            font-size: 22px;
-            color: #FF3B30;
-            font-weight: bold;
-        """
-        return text, stylesheet

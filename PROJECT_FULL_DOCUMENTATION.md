@@ -2358,6 +2358,8 @@ The hardware_worker.py runs as a separate process. If the GUI crashes, the hardw
 | `on_delay`/`off_delay` not implemented | Config stores these values but they have no effect on timing in the current IPC architecture | Client-side debouncing and hold implemented in `hardware_manager.py` |
 | `requirements.txt` is system package list | The file lists system-level Ubuntu packages rather than pure Python dependencies | **RESOLVED** (Purged and regenerated with pure production dependencies) |
 | Git repository hygiene | Missing `.gitignore` causing risk of committing venv and cache | **RESOLVED** (Comprehensive `.gitignore` added for clean GitHub deployment) |
+| Camera dropdown clutter & metadata spam | V4L2 metadata nodes (index > 0) and generic serials flooded the dropdown with 20+ duplicate options | **RESOLVED** (Filtered metadata nodes via sysfs index and bound strictly to physical USB ports) |
+| Camera hotplug thread freeze | Hotplugging camera while GUI is active left station frozen due to stopped worker thread lifecycle | **RESOLVED** (Enforced active thread validation, auto-restart on assignment, and crash-guard in scan loop) |
 
 ### 18.3 Crash Risk Assessment
 

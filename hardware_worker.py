@@ -33,7 +33,6 @@ import socket
 
 try:
     import serial
-    import serial.tools.list_ports
 except ImportError:
     print("[HARDWARE] FATAL: pyserial not installed. Run: pip install pyserial")
     sys.exit(1)

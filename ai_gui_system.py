@@ -23,10 +23,38 @@ import time
 import glob
 import re
 import json
+import tempfile
 import threading
 import platform
 import datetime
 import numpy as np
+import subprocess
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+DEFAULT_PHYSICAL_PATHS = ["1-1", "1-5", "1-2", "1-4"]
+
+def safe_atomic_write_json(file_path, data):
+    """
+    Safely writes JSON data using a temporary file and atomic os.replace,
+    flushing and syncing to disk to guarantee zero-byte corruption resistance
+    against sudden vehicle ignition / power cuts.
+    """
+    dir_name = os.path.dirname(os.path.abspath(file_path))
+    temp_fd, temp_path = tempfile.mkstemp(dir=dir_name, prefix=".tmp_json_")
+    try:
+        with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, file_path)
+    except Exception as e:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        raise e
 
 try:
     import psutil
@@ -54,9 +82,7 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QScrollArea,
     QSlider,
-    QSpinBox,
     QDoubleSpinBox,
-    QAbstractSpinBox,
     QCheckBox,
     QFileDialog,
     QListView,
@@ -75,7 +101,6 @@ from PyQt5.QtCore import (
     QTimer,
     Qt,
     QRect,
-    QPoint,
     QEvent,
     QThread,
     pyqtSignal
@@ -192,9 +217,6 @@ def get_physical_usb_path(device_node):
         for part in reversed(parts):
             if '-' in part and not part.startswith('usb') and ':' not in part:
                 return part
-        for part in parts:
-            if '-' in part and not part.startswith('usb') and ':' not in part:
-                return part
         return real_path
     except Exception:
         return None
@@ -205,11 +227,10 @@ def persist_station_physical_path(station_id, physical_path):
     Persists an auto-detected or configured physical USB port binding to config.json
     for both per-camera and settings dictionaries.
     """
-    config_path = "config.json"
     try:
         data = {}
-        if os.path.exists(config_path):
-            with open(config_path, "r") as f:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
         cam_key = f"camera_{station_id}"
         if cam_key not in data:
@@ -219,14 +240,13 @@ def persist_station_physical_path(station_id, physical_path):
         if "settings" not in data:
             data["settings"] = {}
         if "camera_physical_paths" not in data["settings"]:
-            data["settings"]["camera_physical_paths"] = [None, None, None, None]
+            data["settings"]["camera_physical_paths"] = list(DEFAULT_PHYSICAL_PATHS)
         while len(data["settings"]["camera_physical_paths"]) < 4:
             data["settings"]["camera_physical_paths"].append(None)
         if 0 <= station_id < len(data["settings"]["camera_physical_paths"]):
             data["settings"]["camera_physical_paths"][station_id] = physical_path
 
-        with open(config_path, "w") as f:
-            json.dump(data, f, indent=4)
+        safe_atomic_write_json(CONFIG_PATH, data)
         print(f"[CAM_THREAD] Persisted Station {station_id + 1} physical USB path: {physical_path}")
     except Exception as e:
         print(f"[CAM_THREAD] Failed to persist physical path for Station {station_id + 1}: {e}")
@@ -253,6 +273,16 @@ def get_usb_camera_details(device_node):
     
     full_node = f"/dev/{node_name}" if not str(device_node).startswith("/dev/") else str(device_node)
     
+    # Filter out Linux V4L2 metadata / auxiliary stream nodes (index > 0)
+    idx_path = f"/sys/class/video4linux/{node_name}/index"
+    if os.path.exists(idx_path):
+        try:
+            with open(idx_path, "r") as f:
+                if f.read().strip() != "0":
+                    return None
+        except Exception:
+            pass
+
     sys_path = f"/sys/class/video4linux/{node_name}/device"
     physical_port = None
     serial = None
@@ -363,6 +393,7 @@ def is_camera_node_match(candidate_node, target_binding):
     """
     Checks if a candidate video node matches the configured target binding
     (physical USB port, serial number, by-path/by-id symlink, or device node).
+    Prioritizes STRICT physical USB port matching to eliminate camera swapping.
     """
     if target_binding is None:
         return True
@@ -370,43 +401,53 @@ def is_camera_node_match(candidate_node, target_binding):
     cand_str = str(candidate_node).strip()
     target_str = str(target_binding).strip()
 
-    # 1. Exact node string match
-    if cand_str == target_str:
-        return True
-    
-    # 2. Normalize node index match (e.g. 0 vs /dev/video0)
-    if (cand_str.isdigit() or cand_str.startswith("/dev/video")) and \
-       (target_str.isdigit() or target_str.startswith("/dev/video")):
-        m_cand = re.search(r'\d+', os.path.basename(cand_str))
-        m_tgt = re.search(r'\d+', os.path.basename(target_str))
-        if m_cand and m_tgt and m_cand.group() == m_tgt.group():
-            return True
+    # 1. Clean target string
+    clean_target = target_str[5:].strip() if target_str.startswith("port:") else target_str
 
-    # 3. Check physical USB path from get_physical_usb_path
+    # 2. Check physical USB path FIRST (primary industrial hardware binding)
     cand_phys = get_physical_usb_path(candidate_node)
-    if cand_phys and (cand_phys == target_str or target_str == f"port:{cand_phys}"):
-        return True
+    if cand_phys:
+        if cand_phys == clean_target or cand_phys == target_str or f"port:{cand_phys}" == target_str:
+            return True
+        # If target IS explicitly a physical port (e.g. '1-1', '1-5', etc.),
+        # DO NOT allow fallback to generic serial or index, because candidate is on a different physical port!
+        if '-' in clean_target and not clean_target.startswith("/dev/") and not clean_target.startswith("serial:"):
+            return False
 
     details = get_usb_camera_details(candidate_node)
     if details:
         det_phys = details.get("physical_port")
-        if det_phys and (det_phys == target_str or target_str == f"port:{det_phys}"):
-            return True
-
-        det_serial = details.get("serial")
-        clean_target_serial = target_str[7:].strip() if target_str.startswith("serial:") else target_str
-        if det_serial and (det_serial == clean_target_serial or det_serial == target_str):
-            return True
+        if det_phys:
+            if det_phys == clean_target or det_phys == target_str or f"port:{det_phys}" == target_str:
+                return True
+            if '-' in clean_target and not clean_target.startswith("/dev/") and not clean_target.startswith("serial:"):
+                return False
 
         det_by_path = details.get("by_path")
-        if det_by_path and det_by_path == target_str:
+        if det_by_path and (det_by_path == target_str or det_by_path == clean_target):
             return True
 
-        det_by_id = details.get("by_id")
-        if det_by_id and det_by_id == target_str:
+        # Only allow serial match if target explicitly requested serial (starts with 'serial:')
+        # and NOT generic shared serial 'SN0001'
+        if target_str.startswith("serial:"):
+            clean_target_serial = target_str[7:].strip()
+            det_serial = details.get("serial")
+            if det_serial and clean_target_serial not in ('SN0001', '0001', '') and det_serial == clean_target_serial:
+                return True
+
+    # 3. Fallback matching ONLY when target is not a physical USB port
+    if not ('-' in clean_target and not clean_target.startswith("/dev/")):
+        if cand_str == target_str:
             return True
+        if (cand_str.isdigit() or cand_str.startswith("/dev/video")) and \
+           (target_str.isdigit() or target_str.startswith("/dev/video")):
+            m_cand = re.search(r'\d+', os.path.basename(cand_str))
+            m_tgt = re.search(r'\d+', os.path.basename(target_str))
+            if m_cand and m_tgt and m_cand.group() == m_tgt.group():
+                return True
 
     return False
+
 
 
 # ============================================================
@@ -421,6 +462,7 @@ class CameraWorkerThread(QThread):
     active_physical_paths = set()
     active_device_indices = set()
     _registry_lock = threading.Lock()
+    _probing_lock = threading.Lock()
 
     def __init__(self, device_index, station_id=0, target_physical_usb_path=None, width=640, height=480):
         super().__init__()
@@ -430,7 +472,11 @@ class CameraWorkerThread(QThread):
         else:
             self.device_index = device_index
         self.station_id = station_id
-        self.target_physical_usb_path = target_physical_usb_path
+        # Fallback to default physical port mapping if target_physical_usb_path is None
+        if target_physical_usb_path is None and 0 <= station_id < len(DEFAULT_PHYSICAL_PATHS):
+            self.target_physical_usb_path = DEFAULT_PHYSICAL_PATHS[station_id]
+        else:
+            self.target_physical_usb_path = target_physical_usb_path
         self.current_physical_path = None
         self.current_device_index = None
 
@@ -477,91 +523,115 @@ class CameraWorkerThread(QThread):
         """
         Strict physical reconnection scan:
         1. Iterates available /dev/video* nodes.
-        2. Strict Match Gate: Verifies candidate physical USB path matches target_physical_usb_path.
-        3. Conflict Gate: Ensures candidate physical path & index are not in active registries.
-        4. Validation Gate: Tests opening and reading a valid frame (filters metadata nodes).
+        2. Fast Pre-filter: Skips candidates already claimed by another active station.
+        3. Strict Match Gate (sysfs): Checks physical port WITHOUT touching device with OpenCV.
+        4. Validation Gate (protected by _probing_lock): Only opens candidate when physical port matches.
         5. Registers candidate and binds camera.
         """
-        candidate_nodes = glob.glob('/dev/video*')
+        if self.target_physical_usb_path is None and (self.device_index is None or str(self.device_index).lower() in ('none', '')):
+            return False
+
+        all_nodes = glob.glob('/dev/video*')
+        # Filter out metadata nodes where index != 0
+        candidate_nodes = []
+        for p in all_nodes:
+            b_name = os.path.basename(p)
+            idx_p = f"/sys/class/video4linux/{b_name}/index"
+            if os.path.exists(idx_p):
+                try:
+                    with open(idx_p, "r") as f:
+                        if f.read().strip() != "0":
+                            continue
+                except Exception:
+                    pass
+            candidate_nodes.append(p)
+
         # Sort candidates numerically (video0, video1, video2...)
         def _sort_key(p):
             m = re.search(r'\d+', os.path.basename(p))
             return int(m.group()) if m else 9999
         candidate_nodes.sort(key=_sort_key)
 
-        # Fallback if no /dev/video* filesystem nodes found (e.g. simulated environment)
         if not candidate_nodes and self.device_index is not None:
             candidate_nodes = [self.device_index]
 
         for candidate in candidate_nodes:
             cand_phys = get_physical_usb_path(candidate)
+            cand_idx = self._normalize_device_index(candidate)
+            cand_str = str(candidate)
 
-            # Strict Match Gate:
-            if self.target_physical_usb_path is not None:
-                # If target physical path is set, candidate MUST match target (physical USB port, serial, or node)
-                if not is_camera_node_match(candidate, self.target_physical_usb_path):
-                    continue
-            else:
-                # Initial Boot: target_physical_usb_path not yet set.
-                # If candidate has no physical USB path and does not match initial device_index, skip
-                if cand_phys is None and str(candidate) != str(self.device_index) and self._normalize_device_index(candidate) != self._normalize_device_index(self.device_index):
-                    continue
-
-            # Conflict Gate: Ensure candidate physical path & index are not active elsewhere
+            # Conflict Gate (Pre-filter): Skip candidate if claimed by another active station
             with CameraWorkerThread._registry_lock:
-                cand_idx = self._normalize_device_index(candidate)
-                cand_str = str(candidate)
                 if cand_phys and cand_phys in CameraWorkerThread.active_physical_paths:
                     continue
                 if cand_str in CameraWorkerThread.active_device_indices or cand_idx in CameraWorkerThread.active_device_indices:
                     continue
 
-            # Validation Gate: Open with Camera and verify valid video streaming
-            try:
-                test_cam = Camera(device_index=candidate, width=self.width, height=self.height)
-                if test_cam.cap is None or not test_cam.cap.isOpened():
-                    if test_cam.cap is not None:
-                        test_cam.release()
+            # Strict Match Gate (sysfs check, zero OpenCV overhead, does not disrupt other cameras)
+            if self.target_physical_usb_path is not None:
+                if not is_camera_node_match(candidate, self.target_physical_usb_path):
+                    continue
+            else:
+                if cand_phys is None and str(candidate) != str(self.device_index) and self._normalize_device_index(candidate) != self._normalize_device_index(self.device_index):
                     continue
 
-                ret, frame = test_cam.read_frame()
-                if not ret or frame is None:
-                    test_cam.release()
-                    continue
-
-                # Valid video stream verified. Acquire lock and register ownership.
+            # Validation Gate: Probing lock ensures only ONE thread probes hardware at a time
+            with CameraWorkerThread._probing_lock:
+                # Double-check conflict gate under lock
                 with CameraWorkerThread._registry_lock:
-                    cand_idx = self._normalize_device_index(candidate)
-                    cand_str = str(candidate)
                     if cand_phys and cand_phys in CameraWorkerThread.active_physical_paths:
-                        test_cam.release()
                         continue
                     if cand_str in CameraWorkerThread.active_device_indices or cand_idx in CameraWorkerThread.active_device_indices:
+                        continue
+
+                test_cam = None
+                try:
+                    test_cam = Camera(device_index=candidate, width=self.width, height=self.height)
+                    if test_cam.cap is None or not test_cam.cap.isOpened():
+                        if test_cam is not None:
+                            test_cam.release()
+                        continue
+
+                    ret, frame = test_cam.read_frame()
+                    if not ret or frame is None:
                         test_cam.release()
                         continue
 
-                    # Auto-detect & persist physical path on first successful initial boot
-                    if self.target_physical_usb_path is None and cand_phys:
-                        self.target_physical_usb_path = cand_phys
-                        persist_station_physical_path(self.station_id, cand_phys)
-                        self.path_discovered.emit(self.station_id, cand_phys)
+                    # Valid video stream verified. Acquire registry lock and register ownership.
+                    with CameraWorkerThread._registry_lock:
+                        if cand_phys and cand_phys in CameraWorkerThread.active_physical_paths:
+                            test_cam.release()
+                            continue
+                        if cand_str in CameraWorkerThread.active_device_indices or cand_idx in CameraWorkerThread.active_device_indices:
+                            test_cam.release()
+                            continue
 
-                    if cand_phys:
-                        CameraWorkerThread.active_physical_paths.add(cand_phys)
-                        self.current_physical_path = cand_phys
+                        if self.target_physical_usb_path is None and cand_phys:
+                            self.target_physical_usb_path = cand_phys
+                            persist_station_physical_path(self.station_id, cand_phys)
+                            self.path_discovered.emit(self.station_id, cand_phys)
 
-                    CameraWorkerThread.active_device_indices.add(cand_str)
-                    CameraWorkerThread.active_device_indices.add(cand_idx)
-                    self.current_device_index = candidate
-                    self.camera = test_cam
+                        if cand_phys:
+                            CameraWorkerThread.active_physical_paths.add(cand_phys)
+                            self.current_physical_path = cand_phys
 
-                    with self._frame_lock:
-                        self.latest_frame = frame
-                    self.frame_ready.emit(frame)
-                    return True
+                        CameraWorkerThread.active_device_indices.add(cand_str)
+                        CameraWorkerThread.active_device_indices.add(cand_idx)
+                        self.current_device_index = candidate
+                        self.camera = test_cam
 
-            except Exception as e:
-                continue
+                        with self._frame_lock:
+                            self.latest_frame = frame
+                        self.frame_ready.emit(frame)
+                        return True
+
+                except Exception:
+                    if test_cam is not None:
+                        try:
+                            test_cam.release()
+                        except Exception:
+                            pass
+                    continue
 
         return False
 
@@ -573,10 +643,14 @@ class CameraWorkerThread(QThread):
             # Reconnection / scan loop when camera is not connected
             if self.camera is None or self.camera.cap is None or not self.camera.cap.isOpened():
                 now = time.time()
-                if now - last_scan_time >= 1.5:  # Retry scan quietly every 1-2 seconds
+                if now - last_scan_time >= 1.5:  # Retry scan quietly every 1.5 seconds
                     last_scan_time = now
                     self.status_changed.emit(False, "Reconnecting...")
-                    found = self._scan_for_camera()
+                    found = False
+                    try:
+                        found = self._scan_for_camera()
+                    except Exception as e:
+                        print(f"[CAM_THREAD] Scan error on Station {self.station_id + 1}: {e}")
                     if found:
                         self.status_changed.emit(True, "Online")
                     else:
@@ -598,18 +672,23 @@ class CameraWorkerThread(QThread):
                     print(f"[CAM_THREAD] Station {self.station_id + 1} stream lost. Triggering reconnection...")
                     self._release_camera_locked()
                     self.status_changed.emit(False, "Reconnecting...")
-                    time.sleep(0.1)
+                    time.sleep(0.2)
             except Exception as e:
                 print(f"[CAM_THREAD] Exception reading Station {self.station_id + 1}: {e}")
                 self._release_camera_locked()
                 self.status_changed.emit(False, "Reconnecting...")
-                time.sleep(0.1)
+                time.sleep(0.2)
 
         self._release_camera_locked()
 
     def stop(self):
         self.running = False
-        self.wait(3000)
+        try:
+            if not self.wait(1000):
+                self.terminate()
+                self.wait(500)
+        except Exception:
+            pass
         self._release_camera_locked()
 
 
@@ -655,8 +734,8 @@ class CameraCardWidget(QFrame):
 
         if not self.target_physical_usb_path:
             try:
-                if os.path.exists("config.json"):
-                    with open("config.json", "r") as f:
+                if os.path.exists(CONFIG_PATH):
+                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                         cdata = json.load(f)
                     cam_k = f"camera_{self.cam_id}"
                     if cam_k in cdata and "physical_usb_path" in cdata[cam_k]:
@@ -664,22 +743,16 @@ class CameraCardWidget(QFrame):
             except Exception:
                 pass
 
+        # Final hardware binding safeguard: fallback to default physical USB ports
+        if not self.target_physical_usb_path and 0 <= self.cam_id < len(DEFAULT_PHYSICAL_PATHS):
+            self.target_physical_usb_path = DEFAULT_PHYSICAL_PATHS[self.cam_id]
+
         # Check persisted feed enabled/disabled state
         self.is_feed_enabled = True
         if self.parent_window and hasattr(self.parent_window, "global_settings"):
             cams_en = self.parent_window.global_settings.get("cameras_enabled", [])
             if 0 <= self.cam_id < len(cams_en):
                 self.is_feed_enabled = bool(cams_en[self.cam_id])
-        if not hasattr(self, 'is_feed_enabled') or self.is_feed_enabled is None:
-            try:
-                if os.path.exists("config.json"):
-                    with open("config.json", "r") as f:
-                        cdata = json.load(f)
-                    cam_k = f"camera_{self.cam_id}"
-                    if cam_k in cdata and "enabled" in cdata[cam_k]:
-                        self.is_feed_enabled = bool(cdata[cam_k]["enabled"])
-            except Exception:
-                pass
 
         self.setObjectName("cameraCard")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -817,10 +890,6 @@ class CameraCardWidget(QFrame):
 
         card_layout.addLayout(bottom_row)
 
-        # Placeholders to prevent attribute errors on dynamic settings updates
-        self.relay_combo = None
-        self.btn_test_relay = None
-
         # Load persisted unique coordinates and update preview
         self.load_roi()
         self.update_standby_frame()
@@ -829,10 +898,9 @@ class CameraCardWidget(QFrame):
     # REGION OF INTEREST (ROI) PERSISTENCE
     # ==========================================
     def load_roi(self):
-        config_path = "config.json"
-        if os.path.exists(config_path):
+        if os.path.exists(CONFIG_PATH):
             try:
-                with open(config_path, "r") as f:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 cam_key = f"camera_{self.cam_id}"
                 if cam_key in data:
@@ -861,11 +929,10 @@ class CameraCardWidget(QFrame):
                 print(f"Error loading ROI for station {self.cam_id + 1}: {e}")
 
     def save_roi(self, roi_rect):
-        config_path = "config.json"
         data = {}
-        if os.path.exists(config_path):
+        if os.path.exists(CONFIG_PATH):
             try:
-                with open(config_path, "r") as f:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception:
                 data = {}
@@ -896,8 +963,7 @@ class CameraCardWidget(QFrame):
                 }
 
         try:
-            with open(config_path, "w") as f:
-                json.dump(data, f, indent=4)
+            safe_atomic_write_json(CONFIG_PATH, data)
         except Exception as e:
             print(f"Error writing ROI config for station {self.cam_id + 1}: {e}")
 
@@ -907,43 +973,6 @@ class CameraCardWidget(QFrame):
             self.save_roi(roi_rect)
             if self.parent_window:
                 self.parent_window.add_audit_log(f"Station {self.cam_id + 1} ROI adjusted.", "config")
-
-    def on_relay_changed(self, idx):
-        new_relay = idx + 1
-        if self.parent_window and hasattr(self.parent_window, "global_settings"):
-            if "relay_mapping" not in self.parent_window.global_settings:
-                self.parent_window.global_settings["relay_mapping"] = [1, 2, 3, 4]
-            while len(self.parent_window.global_settings["relay_mapping"]) < 4:
-                self.parent_window.global_settings["relay_mapping"].append(1)
-            self.parent_window.global_settings["relay_mapping"][self.cam_id] = new_relay
-
-            # Keep settings page dropdown in sync
-            if hasattr(self.parent_window, "relay_dropdowns") and self.cam_id < len(self.parent_window.relay_dropdowns):
-                self.parent_window.relay_dropdowns[self.cam_id].blockSignals(True)
-                self.parent_window.relay_dropdowns[self.cam_id].setCurrentIndex(idx)
-                self.parent_window.relay_dropdowns[self.cam_id].blockSignals(False)
-
-            if getattr(self, 'btn_test_relay', None) and not self.btn_test_relay.isChecked():
-                self.btn_test_relay.setText(f"⚡ TEST R{new_relay}")
-
-            self.parent_window.instant_save_timer_config()
-            self.parent_window.add_audit_log(f"Station {self.cam_id + 1} mapped to Relay {new_relay}", "config")
-
-    def on_test_relay_clicked(self, checked):
-        if not self.parent_window:
-            return
-        mapping = self.parent_window.global_settings.get("relay_mapping", [1, 2, 3, 4])
-        target_relay = mapping[self.cam_id] if self.cam_id < len(mapping) else (self.cam_id + 1)
-        relay_idx = target_relay - 1
-
-        if getattr(self, 'btn_test_relay', None):
-            if checked:
-                self.btn_test_relay.setText(f"⚡ R{target_relay} ON")
-            else:
-                self.btn_test_relay.setText(f"⚡ TEST R{target_relay}")
-
-        self.parent_window.test_relay_channel(relay_idx, checked)
-
     # ==========================================
     # LOGICAL BACKEND PIPELINES
     # ==========================================
@@ -953,7 +982,7 @@ class CameraCardWidget(QFrame):
 
         self.is_feed_enabled = True
 
-        if self.is_active:
+        if self.is_active and self.camera_thread is not None and self.camera_thread.isRunning():
             return
         
         self.is_active = True
@@ -1296,6 +1325,7 @@ class CameraCardWidget(QFrame):
         scaled_roi = getattr(self, 'last_scaled_roi', scaled_roi)
 
         # Update metrics label
+        self.current_objects_count = len(persons)
         self.metric_objects_label.setText(f"👥 OBJECTS: {len(persons)}")
 
         # Draw native bounding boxes
@@ -1416,6 +1446,7 @@ class CameraCardWidget(QFrame):
         current_time = time.time()
         fps = 1.0 / (current_time - self.prev_time) if (current_time - self.prev_time) > 0.0 else 0.0
         self.prev_time = current_time
+        self.fps = fps
         
         cv2.putText(frame, f"FPS: {int(fps)}", (20, frame_h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
@@ -2527,11 +2558,119 @@ class ForkliftSafetyGUI(QWidget):
         self.status_check_timer.timeout.connect(self.poll_hardware_status)
         self.status_check_timer.start()
 
+        # Ensure safety kiosk remains strictly in foreground and background assistant remains minimized
+        QTimer.singleShot(2500, self.ensure_kiosk_foreground)
+
+    def ensure_kiosk_foreground(self):
+        """Ensures the safety kiosk window stays primary, dismisses GNOME Overview, and keeps background assistant tools minimized."""
+        try:
+            # 1. Dismiss GNOME Shell Activities Overview if open
+            try:
+                subprocess.run([
+                    "gdbus", "call", "--session", "--dest", "org.gnome.Shell",
+                    "--object-path", "/org/gnome/Shell",
+                    "--method", "org.freedesktop.DBus.Properties.Set",
+                    "org.gnome.Shell", "OverviewActive", "<false>"
+                ], timeout=0.5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+            # 2. Re-assert Fullscreen and bring to front
+            if not self.isFullScreen():
+                self.showFullScreen()
+            self.raise_()
+            self.activateWindow()
+
+            # 3. Withdraw any assistant/background windows
+            import ctypes
+            class XClassHint(ctypes.Structure):
+                _fields_ = [("res_name", ctypes.c_char_p), ("res_class", ctypes.c_char_p)]
+
+            X11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+            X11.XOpenDisplay.restype = ctypes.c_void_p
+            X11.XDefaultRootWindow.restype = ctypes.c_ulong
+            X11.XDefaultScreen.restype = ctypes.c_int
+            X11.XQueryTree.restype = ctypes.c_int
+            X11.XGetClassHint.restype = ctypes.c_int
+
+            disp = X11.XOpenDisplay(None)
+            if not disp:
+                return
+            screen = X11.XDefaultScreen(disp)
+            root = X11.XDefaultRootWindow(disp)
+            root_ret, parent_ret, children_ret, nchildren_ret = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.POINTER(ctypes.c_ulong)(), ctypes.c_uint()
+            if X11.XQueryTree(disp, root, ctypes.byref(root_ret), ctypes.byref(parent_ret), ctypes.byref(children_ret), ctypes.byref(nchildren_ret)):
+                hint = XClassHint()
+                for i in range(nchildren_ret.value):
+                    w = children_ret[i]
+                    if X11.XGetClassHint(disp, ctypes.c_ulong(w), ctypes.byref(hint)):
+                        res_name = hint.res_name.decode("utf-8", "ignore") if hint.res_name else ""
+                        res_class = hint.res_class.decode("utf-8", "ignore") if hint.res_class else ""
+                        if "antigravity" in res_name.lower() or "antigravity" in res_class.lower():
+                            X11.XWithdrawWindow(disp, ctypes.c_ulong(w), ctypes.c_int(screen))
+                            X11.XIconifyWindow(disp, ctypes.c_ulong(w), ctypes.c_int(screen))
+                            X11.XLowerWindow(disp, ctypes.c_ulong(w))
+                        if "ai_gui_system" in res_name.lower() or "ai_gui_system" in res_class.lower():
+                            X11.XRaiseWindow(disp, ctypes.c_ulong(w))
+                X11.XFlush(disp)
+            X11.XCloseDisplay(disp)
+        except Exception as e:
+            print(f"[KIOSK] Window layering check notice: {e}")
+
+    def changeEvent(self, event):
+        """Auto-recovers fullscreen if GNOME Shell attempts to minimize or exit fullscreen (Operator mode only)."""
+        if event.type() in [QEvent.WindowStateChange, QEvent.ActivationChange]:
+            if getattr(self, 'current_role', 'Operator') == 'Operator':
+                if not self.isFullScreen() or not self.isActiveWindow():
+                    QTimer.singleShot(150, self.ensure_kiosk_foreground)
+        super().changeEvent(event)
+
+
+
+
+    def toggle_gnome_overview(self):
+        """Toggles GNOME Shell Activities Overview via D-Bus for Supervisor."""
+        try:
+            res = subprocess.run([
+                "gdbus", "call", "--session", "--dest", "org.gnome.Shell",
+                "--object-path", "/org/gnome/Shell",
+                "--method", "org.freedesktop.DBus.Properties.Get",
+                "org.gnome.Shell", "OverviewActive"
+            ], capture_output=True, text=True, timeout=0.5)
+
+            is_active = "<true>" in res.stdout
+            new_state = "<false>" if is_active else "<true>"
+
+            subprocess.run([
+                "gdbus", "call", "--session", "--dest", "org.gnome.Shell",
+                "--object-path", "/org/gnome/Shell",
+                "--method", "org.freedesktop.DBus.Properties.Set",
+                "org.gnome.Shell", "OverviewActive", new_state
+            ], timeout=0.5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[KIOSK] Toggle overview notice: {e}")
 
     # ==========================================
-    # GLOBAL APPLICATION INPUT EVENT FILTER (INACTIVITY TIMEOUT RESET)
+    # GLOBAL APPLICATION INPUT EVENT FILTER & KEY INTERCEPTION
     # ==========================================
     def eventFilter(self, obj, event):
+        # Handle Super / Windows key dynamically based on current role
+        if event.type() == QEvent.KeyPress and hasattr(event, 'key'):
+            if event.key() in (Qt.Key_Super_L, Qt.Key_Super_R, Qt.Key_Meta):
+                if getattr(self, 'current_role', 'Operator') != 'Operator':
+                    # Supervisor / Engineer / Admin: Toggle Overview & Workspaces
+                    self.toggle_gnome_overview()
+                return True  # Consume key event
+
+        # In Operator mode only: trap workspace navigation shortcuts
+        if getattr(self, 'current_role', 'Operator') == 'Operator':
+            if event.type() in [QEvent.KeyPress, QEvent.KeyRelease]:
+                if hasattr(event, 'key') and event.key() in (Qt.Key_Super_L, Qt.Key_Super_R, Qt.Key_Meta, Qt.Key_Menu):
+                    return True  # Consume key event completely for Operator
+                if hasattr(event, 'modifiers') and (event.modifiers() & (Qt.MetaModifier | Qt.AltModifier)):
+                    if hasattr(event, 'key') and event.key() in (Qt.Key_Tab, Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_PageUp, Qt.Key_PageDown, Qt.Key_Home, Qt.Key_End):
+                        return True  # Consume workspace navigation shortcuts for Operator
+
         # Refresh inactivity countdown timer if any mouse/keyboard actions occur
         if event.type() in [
             QEvent.MouseButtonPress,
@@ -2545,11 +2684,34 @@ class ForkliftSafetyGUI(QWidget):
                 self.inactivity_timer.start()  # Re-fires timer, resetting interval
         return super().eventFilter(obj, event)
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Super_L, Qt.Key_Super_R, Qt.Key_Meta):
+            if getattr(self, 'current_role', 'Operator') != 'Operator':
+                self.toggle_gnome_overview()
+            event.accept()
+            return
+
+        # In Operator mode only: block modifier combinations
+        if getattr(self, 'current_role', 'Operator') == 'Operator':
+            if event.modifiers() & (Qt.MetaModifier | Qt.AltModifier):
+                if event.key() in (Qt.Key_Tab, Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_PageUp, Qt.Key_PageDown, Qt.Key_Home, Qt.Key_End):
+                    event.accept()
+                    return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() in (Qt.Key_Super_L, Qt.Key_Super_R, Qt.Key_Meta, Qt.Key_Menu):
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
     def auto_logout(self):
         """Autologout handler triggers rollback to Operator access state."""
         if self.current_role != "Operator":
             self.role_combo.setCurrentText("Operator")
             self.add_audit_log("AUTO-LOGOUT: Inactivity timeout reached. Rolled back to Operator.", "warning")
+            self.ensure_kiosk_foreground()
+
 
     # ==========================================
     # NAVIGATION METHODS
@@ -2594,40 +2756,28 @@ class ForkliftSafetyGUI(QWidget):
 
     def scan_all_usb_camera_devices(self):
         """
-        Scans all available video nodes and physical USB devices to return rich details:
-        - connected_cams: list of details dicts for all detected /dev/video* cameras
-        - physical_ports: list of all detected physical USB ports
+        Scans all available video nodes to return rich details for real cameras:
+        - connected_cams: list of details dicts for all detected /dev/video* cameras (deduplicated by physical port)
+        - physical_ports: list of all detected physical USB ports with connected cameras
         """
         nodes = sorted(glob.glob('/dev/video*'))
         connected_cams = []
+        seen_ports = set()
         physical_ports = set()
 
         for node in nodes:
             details = get_usb_camera_details(node)
-            if details:
-                connected_cams.append(details)
-                if details.get("physical_port"):
-                    physical_ports.add(details["physical_port"])
-            else:
-                phys = get_physical_usb_path(node)
-                if phys:
-                    physical_ports.add(phys)
-
-        # Scan sysfs usb bus devices to include all available motherboard / hub ports
-        try:
-            for dev_path in glob.glob('/sys/bus/usb/devices/*'):
-                base = os.path.basename(dev_path)
-                if '-' in base and not base.startswith('usb') and ':' not in base:
-                    physical_ports.add(base)
-        except Exception:
-            pass
+            if not details:
+                continue
+            port = details.get("physical_port")
+            if port and port in seen_ports:
+                continue
+            if port:
+                seen_ports.add(port)
+                physical_ports.add(port)
+            connected_cams.append(details)
 
         return connected_cams, sorted(list(physical_ports))
-
-    def scan_available_physical_usb_ports(self):
-        """Scans all available /dev/video* device nodes and resolves their physical USB paths."""
-        _, ports = self.scan_all_usb_camera_devices()
-        return ports
 
     def _update_station_bind_badge(self, station_idx, bound_val):
         """Updates the visual lock status badge for a display station."""
@@ -2650,14 +2800,12 @@ class ForkliftSafetyGUI(QWidget):
 
     def refresh_camera_mapping_dropdowns(self):
         """
-        Populates each station's dropdown with scanned active USB cameras,
-        physical bus ports, serial numbers, video nodes, and saved configs.
+        Populates each station's dropdown with scanned active USB cameras.
+        Deduplicates entries, filters out V4L2 metadata nodes, and eliminates clutter.
         """
         connected_cams, available_ports = self.scan_all_usb_camera_devices()
-        available_nodes = sorted(glob.glob('/dev/video*'))
         saved_paths = self.global_settings.get("camera_physical_paths", [None, None, None, None])
         saved_nodes = self.global_settings.get("camera_mapping", [0, 2, 4, 6])
-        standard_nodes = [f"/dev/video{x}" for x in range(8)]
 
         for i, combo in enumerate(self.cam_port_dropdowns):
             combo.blockSignals(True)
@@ -2669,79 +2817,64 @@ class ForkliftSafetyGUI(QWidget):
                     current_choice = saved_nodes[i]
 
             combo.clear()
-            node_fallback = saved_nodes[i] if i < len(saved_nodes) else f"/dev/video{i*2}"
+            added_data = set()
 
-            # 1. Scanned connected USB cameras with full details (Port + Serial + Model + Node)
+            # 1. Scanned connected physical cameras (single clean entry per camera)
             for cam in connected_cams:
                 port = cam.get("physical_port")
-                serial = cam.get("serial")
                 node = cam.get("node")
                 prod = cam.get("product") or "Camera"
 
-                if port and serial:
-                    label = f"🔌 USB Port [{port}] | Serial: {serial} ({prod} - {node})"
-                    combo.addItem(label, port)
-                    combo.addItem(f"🏷️ Serial: {serial} ({prod} - Port {port})", f"serial:{serial}")
-                elif port:
-                    label = f"🔌 USB Port [{port}] ({prod} - {node})"
-                    combo.addItem(label, port)
-                elif serial:
-                    label = f"🏷️ Serial: {serial} ({prod} - {node})"
-                    combo.addItem(label, f"serial:{serial}")
+                if port:
+                    label = f"🔌 USB Port [{port}] — {prod} ({node})"
+                    data_val = port
                 else:
-                    label = f"📹 {node} ({prod})"
-                    combo.addItem(label, node)
+                    label = f"📹 {node} — {prod}"
+                    data_val = node
 
-            # 2. All physical USB bus ports (allows fixing port to prevent vibration swaps)
-            for port in available_ports:
-                found_item = False
-                for idx in range(combo.count()):
-                    if combo.itemData(idx) == port:
-                        found_item = True
-                        break
-                if not found_item:
-                    combo.addItem(f"🔌 USB Port [{port}]", port)
+                combo.addItem(label, data_val)
+                added_data.add(str(data_val))
 
-            # 3. Scanned real V4L2 device nodes (if physically present)
-            for node in available_nodes:
-                found_item = False
-                for idx in range(combo.count()):
-                    if combo.itemData(idx) == node:
-                        found_item = True
-                        break
-                if not found_item:
-                    phys = get_physical_usb_path(node)
-                    desc = f"📹 {node} [USB: {phys}]" if phys else f"📹 {node}"
-                    combo.addItem(desc, node)
+            # 2. None / Disabled option
+            combo.addItem("🚫 None / Disabled", "None")
+            added_data.add("None")
 
-            # 4. Saved choice preservation if not in scanned list
-            if current_choice is not None:
-                found = False
-                for idx in range(combo.count()):
-                    if combo.itemData(idx) == current_choice or str(combo.itemData(idx)) == str(current_choice):
-                        found = True
-                        break
-                if not found:
-                    combo.addItem(f"💾 Saved: {current_choice}", current_choice)
-
-            # Fallback if combo is empty
-            if combo.count() == 0:
-                combo.addItem(f"Node {node_fallback}", node_fallback)
+            # 3. Preserved saved choice if currently disconnected
+            if current_choice is not None and str(current_choice) not in added_data and str(current_choice) != "None":
+                combo.addItem(f"💾 Saved: Port [{current_choice}] (Disconnected)", current_choice)
 
             # Select matching item
-            selected_idx = 0
+            selected_idx = -1
             if current_choice is not None:
                 for idx in range(combo.count()):
-                    if combo.itemData(idx) == current_choice or str(combo.itemData(idx)) == str(current_choice):
+                    item_d = combo.itemData(idx)
+                    if item_d == current_choice or str(item_d) == str(current_choice):
                         selected_idx = idx
                         break
+
+            # Fallback selection if current_choice not found
+            if selected_idx == -1:
+                if i < len(connected_cams):
+                    cand_val = connected_cams[i].get("physical_port") or connected_cams[i].get("node")
+                    for idx in range(combo.count()):
+                        if combo.itemData(idx) == cand_val:
+                            selected_idx = idx
+                            break
+                if selected_idx == -1:
+                    for idx in range(combo.count()):
+                        if combo.itemData(idx) == "None":
+                            selected_idx = idx
+                            break
+                if selected_idx == -1:
+                    selected_idx = 0
+
             combo.setCurrentIndex(selected_idx)
             combo.blockSignals(False)
 
             # Update lock status badge & active node display
             self._update_station_bind_badge(i, combo.currentData())
             if i < len(self.cam_node_labels):
-                active_dev = str(combo.currentData()) if combo.currentData() is not None else str(node_fallback)
+                active_dev = str(combo.currentData()) if combo.currentData() is not None else "Unassigned"
                 self.cam_node_labels[i].setText(active_dev)
 
     def on_camera_port_reassigned(self, station_idx):
@@ -2756,7 +2889,9 @@ class ForkliftSafetyGUI(QWidget):
         target_val = selected_data if selected_data is not None else selected_text
         if isinstance(target_val, str):
             target_val = target_val.strip()
-            if "USB Port: " in target_val:
+            if target_val in ("None", "none", "🚫 None / Disabled", "🚫 None"):
+                target_val = None
+            elif "USB Port: " in target_val:
                 target_val = target_val.split("USB Port: ")[-1].strip()
             elif "USB Port [" in target_val:
                 target_val = target_val.split("USB Port [")[-1].split("]")[0].strip()
@@ -2778,7 +2913,7 @@ class ForkliftSafetyGUI(QWidget):
             self.global_settings["camera_mapping"].append(0)
 
         is_phys_or_serial = False
-        if target_val and isinstance(target_val, str) and not target_val.startswith("/dev/video") and not target_val.isdigit() and "Auto" not in target_val:
+        if target_val and isinstance(target_val, str) and target_val not in ("None", "none") and not target_val.startswith("/dev/video") and not target_val.isdigit() and "Auto" not in target_val:
             is_phys_or_serial = True
 
         if is_phys_or_serial:
@@ -2786,7 +2921,7 @@ class ForkliftSafetyGUI(QWidget):
             persist_station_physical_path(station_idx, target_val)
             card_phys = target_val
             card_node = self.global_settings["camera_mapping"][station_idx]
-        elif target_val is not None and "Auto" not in str(target_val):
+        elif target_val is not None and "Auto" not in str(target_val) and str(target_val) not in ("None", "none"):
             node_idx = int(target_val) if str(target_val).isdigit() else target_val
             self.global_settings["camera_mapping"][station_idx] = node_idx
             self.global_settings["camera_physical_paths"][station_idx] = None
@@ -2797,24 +2932,25 @@ class ForkliftSafetyGUI(QWidget):
             self.global_settings["camera_physical_paths"][station_idx] = None
             persist_station_physical_path(station_idx, None)
             card_phys = None
-            card_node = self.global_settings["camera_mapping"][station_idx]
+            card_node = None
 
         self.instant_save_timer_config()
 
         # Update badge and node label in settings view
         self._update_station_bind_badge(station_idx, card_phys or target_val)
         if station_idx < len(self.cam_node_labels):
-            self.cam_node_labels[station_idx].setText(str(target_val or card_node))
+            self.cam_node_labels[station_idx].setText(str(target_val or "Unassigned"))
 
         if station_idx < len(self.cards):
             card = self.cards[station_idx]
             card.target_physical_usb_path = card_phys
             card.device_index = card_node
-            if card.camera_thread is not None:
+            if card.camera_thread is not None and card.camera_thread.isRunning():
                 card.camera_thread.target_physical_usb_path = card_phys
                 card.camera_thread.device_index = card_node
                 card.camera_thread._release_camera_locked()
-
+            else:
+                card.start_camera(persist=False)
         self.add_audit_log(f"Station {station_idx + 1} locked to: {target_val or 'Unassigned'}", "config")
 
     def show_config_page(self):
@@ -2852,22 +2988,27 @@ class ForkliftSafetyGUI(QWidget):
         page.setStyleSheet("""
             QWidget { background: transparent; color: #e2e8f0; font-family: 'Segoe UI', 'Ubuntu', sans-serif; }
             QGroupBox {
-                border: 1px solid #2d3846;
+                border: 1px solid #2d3848;
                 border-radius: 8px;
-                margin-top: 16px;
-                padding-top: 16px;
-                font-family: 'Segoe UI Semibold';
+                margin-top: 22px;
+                padding-top: 18px;
+                padding-bottom: 12px;
+                padding-left: 12px;
+                padding-right: 12px;
+                font-family: 'Segoe UI', 'Ubuntu', sans-serif;
                 font-size: 11px;
                 font-weight: bold;
                 color: #63b3ed;
-                background-color: #121721;
+                background-color: #111622;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
-                padding: 2px 8px;
-                background-color: #1a2230;
-                border: 1px solid #2d3846;
+                left: 12px;
+                top: 4px;
+                padding: 2px 10px;
+                background-color: #1a2234;
+                border: 1px solid #2d3848;
                 border-radius: 4px;
                 color: #63b3ed;
             }
@@ -2879,8 +3020,8 @@ class ForkliftSafetyGUI(QWidget):
                 color: #ffffff;
                 font-weight: bold;
                 font-size: 10px;
-                min-height: 16px;
-                max-height: 16px;
+                min-height: 14px;
+                max-height: 14px;
             }
             QProgressBar::chunk {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3182ce, stop:1 #48bb78);
@@ -2890,7 +3031,7 @@ class ForkliftSafetyGUI(QWidget):
 
         layout = QVBoxLayout(page)
         layout.setContentsMargins(14, 14, 16, 20)
-        layout.setSpacing(12)
+        layout.setSpacing(14)
 
         # ----------------------------------------------------
         # 1. HEADER & ACTION TOOLBAR
@@ -2898,7 +3039,7 @@ class ForkliftSafetyGUI(QWidget):
         header_frame = QFrame()
         header_frame.setStyleSheet("background-color: #161c28; border: 1px solid #2d3846; border-radius: 8px; padding: 6px;")
         header_layout = QHBoxLayout(header_frame)
-        header_layout.setContentsMargins(10, 6, 10, 6)
+        header_layout.setContentsMargins(12, 6, 12, 6)
 
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
@@ -2906,6 +3047,7 @@ class ForkliftSafetyGUI(QWidget):
         lbl_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #63b3ed; border: none;")
         lbl_sub = QLabel("Live Telemetry: CPU, Thermals, Process Threads, Memory, Storage, Cameras & Relay Controller")
         lbl_sub.setStyleSheet("font-size: 10px; color: #a0aec0; border: none;")
+        lbl_sub.setWordWrap(True)
         title_box.addWidget(lbl_title)
         title_box.addWidget(lbl_sub)
         header_layout.addLayout(title_box)
@@ -2916,7 +3058,7 @@ class ForkliftSafetyGUI(QWidget):
         self.lbl_diag_global_badge = QLabel("🟢 SYSTEM OPTIMAL")
         self.lbl_diag_global_badge.setStyleSheet("""
             background-color: #1c4532; color: #48bb78; font-family: 'Segoe UI Semibold';
-            font-size: 11px; font-weight: bold; padding: 6px 12px; border-radius: 6px; border: 1px solid #2f855a;
+            font-size: 11px; font-weight: bold; padding: 6px 14px; border-radius: 6px; border: 1px solid #2f855a;
         """)
         header_layout.addWidget(self.lbl_diag_global_badge)
 
@@ -2958,12 +3100,18 @@ class ForkliftSafetyGUI(QWidget):
             }
         """
 
+        subcard_style = """
+            QFrame {
+                background-color: #161c28; border: 1px solid #232c3d; border-radius: 6px; padding: 10px;
+            }
+        """
+
         # KPI Card 1: CPU Total
         card_cpu = QFrame()
         card_cpu.setStyleSheet(card_style)
         card_cpu_layout = QVBoxLayout(card_cpu)
-        card_cpu_layout.setContentsMargins(8, 8, 8, 8)
-        card_cpu_layout.setSpacing(4)
+        card_cpu_layout.setContentsMargins(10, 10, 10, 10)
+        card_cpu_layout.setSpacing(5)
         lbl_kpi_cpu_title = QLabel("⚡ TOTAL CPU LOAD")
         lbl_kpi_cpu_title.setStyleSheet("color: #63b3ed; font-size: 10px; font-weight: bold; border: none;")
         self.lbl_kpi_cpu_val = QLabel("0.0%")
@@ -2983,9 +3131,9 @@ class ForkliftSafetyGUI(QWidget):
         card_temp = QFrame()
         card_temp.setStyleSheet(card_style)
         card_temp_layout = QVBoxLayout(card_temp)
-        card_temp_layout.setContentsMargins(8, 8, 8, 8)
-        card_temp_layout.setSpacing(4)
-        lbl_kpi_temp_title = QLabel("🌡️ THERMALS & ENVIRONMENT")
+        card_temp_layout.setContentsMargins(10, 10, 10, 10)
+        card_temp_layout.setSpacing(5)
+        lbl_kpi_temp_title = QLabel("🌡️ THERMAL STATUS")
         lbl_kpi_temp_title.setStyleSheet("color: #63b3ed; font-size: 10px; font-weight: bold; border: none;")
         self.lbl_kpi_temp_val = QLabel("--.- °C")
         self.lbl_kpi_temp_val.setStyleSheet("font-size: 20px; font-weight: bold; color: #48bb78; border: none;")
@@ -2997,7 +3145,7 @@ class ForkliftSafetyGUI(QWidget):
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #48bb78, stop:0.7 #ecc94b, stop:1 #e53e3e);
             }
         """)
-        self.lbl_kpi_temp_sub = QLabel("CPU Pkg: --°C | NVMe: --°C")
+        self.lbl_kpi_temp_sub = QLabel("CPU Package: Optimal")
         self.lbl_kpi_temp_sub.setStyleSheet("font-size: 9px; color: #a0aec0; border: none;")
         card_temp_layout.addWidget(lbl_kpi_temp_title)
         card_temp_layout.addWidget(self.lbl_kpi_temp_val)
@@ -3009,8 +3157,8 @@ class ForkliftSafetyGUI(QWidget):
         card_mem = QFrame()
         card_mem.setStyleSheet(card_style)
         card_mem_layout = QVBoxLayout(card_mem)
-        card_mem_layout.setContentsMargins(8, 8, 8, 8)
-        card_mem_layout.setSpacing(4)
+        card_mem_layout.setContentsMargins(10, 10, 10, 10)
+        card_mem_layout.setSpacing(5)
         lbl_kpi_mem_title = QLabel("💾 RAM & STORAGE")
         lbl_kpi_mem_title.setStyleSheet("color: #63b3ed; font-size: 10px; font-weight: bold; border: none;")
         self.lbl_kpi_ram_val = QLabel("RAM: 0.0%")
@@ -3030,15 +3178,15 @@ class ForkliftSafetyGUI(QWidget):
         card_proc = QFrame()
         card_proc.setStyleSheet(card_style)
         card_proc_layout = QVBoxLayout(card_proc)
-        card_proc_layout.setContentsMargins(8, 8, 8, 8)
-        card_proc_layout.setSpacing(4)
-        lbl_kpi_proc_title = QLabel("🧵 THREADS & APPLICATION")
+        card_proc_layout.setContentsMargins(10, 10, 10, 10)
+        card_proc_layout.setSpacing(5)
+        lbl_kpi_proc_title = QLabel("🧵 PROCESS & THREADS")
         lbl_kpi_proc_title.setStyleSheet("color: #63b3ed; font-size: 10px; font-weight: bold; border: none;")
         self.lbl_kpi_threads_val = QLabel("-- Threads")
         self.lbl_kpi_threads_val.setStyleSheet("font-size: 20px; font-weight: bold; color: #63b3ed; border: none;")
         self.lbl_kpi_proc_sub = QLabel("App CPU: --% | RAM: -- MB")
         self.lbl_kpi_proc_sub.setStyleSheet("font-size: 10px; font-weight: bold; color: #cbd5e0; border: none;")
-        self.lbl_kpi_uptime_sub = QLabel("App Uptime: -- | System Uptime: --")
+        self.lbl_kpi_uptime_sub = QLabel("App Uptime: --")
         self.lbl_kpi_uptime_sub.setStyleSheet("font-size: 9px; color: #a0aec0; border: none;")
         card_proc_layout.addWidget(lbl_kpi_proc_title)
         card_proc_layout.addWidget(self.lbl_kpi_threads_val)
@@ -3052,15 +3200,18 @@ class ForkliftSafetyGUI(QWidget):
         # 3. GROUP: CPU PER-CORE & THERMAL SENSORS
         # ----------------------------------------------------
         grp_cpu_thermal = QGroupBox("🔥 PROCESSOR CORES & THERMAL SENSORS")
-        cpu_thermal_layout = QGridLayout(grp_cpu_thermal)
-        cpu_thermal_layout.setContentsMargins(12, 12, 12, 12)
-        cpu_thermal_layout.setSpacing(10)
+        cpu_thermal_layout = QHBoxLayout(grp_cpu_thermal)
+        cpu_thermal_layout.setContentsMargins(10, 10, 10, 10)
+        cpu_thermal_layout.setSpacing(12)
 
-        # Left Column: Per-Core Load Bars
-        core_box = QVBoxLayout()
+        # Left Sub-Card: Per-Core Load Bars
+        core_card = QFrame()
+        core_card.setStyleSheet(subcard_style)
+        core_box = QVBoxLayout(core_card)
+        core_box.setContentsMargins(10, 10, 10, 10)
         core_box.setSpacing(6)
-        core_hdr = QLabel("Per-Core Load Breakdown:")
-        core_hdr.setStyleSheet("font-weight: bold; color: #cbd5e0; font-size: 10px;")
+        core_hdr = QLabel("⚡ Per-Core Load Breakdown:")
+        core_hdr.setStyleSheet("font-weight: bold; color: #cbd5e0; font-size: 11px; border: none;")
         core_box.addWidget(core_hdr)
 
         self.bar_core = []
@@ -3069,14 +3220,14 @@ class ForkliftSafetyGUI(QWidget):
             c_row = QHBoxLayout()
             c_row.setSpacing(8)
             lbl_c = QLabel(f"Core {c}:")
-            lbl_c.setFixedWidth(50)
-            lbl_c.setStyleSheet("font-family: monospace; font-size: 10px; color: #a0aec0;")
+            lbl_c.setFixedWidth(52)
+            lbl_c.setStyleSheet("font-family: monospace; font-size: 10px; color: #a0aec0; border: none;")
             bar_c = QProgressBar()
             bar_c.setRange(0, 100)
             bar_c.setValue(0)
             val_c = QLabel("0%")
             val_c.setFixedWidth(45)
-            val_c.setStyleSheet("font-family: monospace; font-size: 10px; font-weight: bold; color: #ffffff;")
+            val_c.setStyleSheet("font-family: monospace; font-size: 10px; font-weight: bold; color: #ffffff; border: none;")
             c_row.addWidget(lbl_c)
             c_row.addWidget(bar_c, stretch=1)
             c_row.addWidget(val_c)
@@ -3085,151 +3236,198 @@ class ForkliftSafetyGUI(QWidget):
             self.lbl_core_val.append(val_c)
 
         self.lbl_cpu_meta = QLabel("Processor: Intel(R) Core(TM) i5-6500T @ 2.50GHz (4 Cores / 4 Threads)")
-        self.lbl_cpu_meta.setStyleSheet("font-size: 9px; color: #718096; padding-top: 4px;")
+        self.lbl_cpu_meta.setStyleSheet("font-size: 9px; color: #718096; padding-top: 4px; border: none;")
+        self.lbl_cpu_meta.setWordWrap(True)
         core_box.addWidget(self.lbl_cpu_meta)
 
-        cpu_thermal_layout.addLayout(core_box, 0, 0)
+        cpu_thermal_layout.addWidget(core_card, stretch=1)
 
-        # Right Column: Thermal Sensors Breakdown
-        thermal_box = QVBoxLayout()
+        # Right Sub-Card: Thermal Sensors Breakdown
+        thermal_card = QFrame()
+        thermal_card.setStyleSheet(subcard_style)
+        thermal_box = QVBoxLayout(thermal_card)
+        thermal_box.setContentsMargins(10, 10, 10, 10)
         thermal_box.setSpacing(6)
-        th_hdr = QLabel("Hardware Thermal Sensor Readings:")
-        th_hdr.setStyleSheet("font-weight: bold; color: #cbd5e0; font-size: 10px;")
+        th_hdr = QLabel("🌡️ Hardware Thermal Sensor Readings:")
+        th_hdr.setStyleSheet("font-weight: bold; color: #cbd5e0; font-size: 11px; border: none;")
         thermal_box.addWidget(th_hdr)
 
         self.lbl_temp_cpu_pkg = QLabel("• CPU Package: --.- °C (High: 84°C, Crit: 100°C)")
-        self.lbl_temp_cpu_pkg.setStyleSheet("font-family: monospace; font-size: 10px; color: #48bb78;")
+        self.lbl_temp_cpu_pkg.setStyleSheet("font-family: monospace; font-size: 10px; color: #48bb78; border: none;")
+        self.lbl_temp_cpu_pkg.setWordWrap(True)
         thermal_box.addWidget(self.lbl_temp_cpu_pkg)
 
-        self.lbl_temp_cpu_cores = QLabel("• CPU Cores [0,1,2,3]: --.- °C, --.- °C, --.- °C, --.- °C")
-        self.lbl_temp_cpu_cores.setStyleSheet("font-family: monospace; font-size: 10px; color: #48bb78;")
+        self.lbl_temp_cpu_cores = QLabel("• CPU Cores [0-3]: --.- °C, --.- °C, --.- °C, --.- °C")
+        self.lbl_temp_cpu_cores.setStyleSheet("font-family: monospace; font-size: 10px; color: #48bb78; border: none;")
+        self.lbl_temp_cpu_cores.setWordWrap(True)
         thermal_box.addWidget(self.lbl_temp_cpu_cores)
 
         self.lbl_temp_nvme = QLabel("• NVMe SSD Storage: --.- °C (Crit: 94.85°C)")
-        self.lbl_temp_nvme.setStyleSheet("font-family: monospace; font-size: 10px; color: #63b3ed;")
+        self.lbl_temp_nvme.setStyleSheet("font-family: monospace; font-size: 10px; color: #63b3ed; border: none;")
+        self.lbl_temp_nvme.setWordWrap(True)
         thermal_box.addWidget(self.lbl_temp_nvme)
 
         self.lbl_temp_pch = QLabel("• Motherboard Chipset (PCH): --.- °C")
-        self.lbl_temp_pch.setStyleSheet("font-family: monospace; font-size: 10px; color: #a0aec0;")
+        self.lbl_temp_pch.setStyleSheet("font-family: monospace; font-size: 10px; color: #a0aec0; border: none;")
+        self.lbl_temp_pch.setWordWrap(True)
         thermal_box.addWidget(self.lbl_temp_pch)
 
         self.lbl_temp_wifi = QLabel("• Wireless Adapter (WiFi): --.- °C")
-        self.lbl_temp_wifi.setStyleSheet("font-family: monospace; font-size: 10px; color: #a0aec0;")
+        self.lbl_temp_wifi.setStyleSheet("font-family: monospace; font-size: 10px; color: #a0aec0; border: none;")
+        self.lbl_temp_wifi.setWordWrap(True)
         thermal_box.addWidget(self.lbl_temp_wifi)
 
-        cpu_thermal_layout.addLayout(thermal_box, 0, 1)
+        thermal_box.addStretch()
+        cpu_thermal_layout.addWidget(thermal_card, stretch=1)
         layout.addWidget(grp_cpu_thermal)
 
         # ----------------------------------------------------
         # 4. GROUP: SOFTWARE & PROCESS DIAGNOSTICS
         # ----------------------------------------------------
         grp_sw = QGroupBox("💻 SOFTWARE & PROCESS DIAGNOSTICS")
-        sw_layout = QGridLayout(grp_sw)
-        sw_layout.setContentsMargins(12, 12, 12, 12)
-        sw_layout.setSpacing(10)
+        sw_layout = QHBoxLayout(grp_sw)
+        sw_layout.setContentsMargins(10, 10, 10, 10)
+        sw_layout.setSpacing(12)
 
-        # Sub-card: Threads & Process
-        sw_threads_box = QVBoxLayout()
+        # Left Sub-card: Threads & Process
+        threads_card = QFrame()
+        threads_card.setStyleSheet(subcard_style)
+        sw_threads_box = QVBoxLayout(threads_card)
+        sw_threads_box.setContentsMargins(10, 10, 10, 10)
         sw_threads_box.setSpacing(6)
-        lbl_th_title = QLabel("Active Thread Breakdown:")
-        lbl_th_title.setStyleSheet("font-weight: bold; color: #cbd5e0; font-size: 10px;")
+        lbl_th_title = QLabel("🧵 Active Thread Breakdown:")
+        lbl_th_title.setStyleSheet("font-weight: bold; color: #cbd5e0; font-size: 11px; border: none;")
         sw_threads_box.addWidget(lbl_th_title)
 
         self.lbl_diag_threads_summary = QLabel("Total Process Threads: -- OS Threads | Python: -- Threads")
-        self.lbl_diag_threads_summary.setStyleSheet("color: #63b3ed; font-family: monospace; font-size: 10px; font-weight: bold;")
+        self.lbl_diag_threads_summary.setStyleSheet("color: #63b3ed; font-family: monospace; font-size: 10px; font-weight: bold; border: none;")
+        self.lbl_diag_threads_summary.setWordWrap(True)
         sw_threads_box.addWidget(self.lbl_diag_threads_summary)
 
         self.lbl_diag_threads_list = QLabel("Threads: MainThread (GUI), CameraWorker-1..4, RelayIPC, Timers")
-        self.lbl_diag_threads_list.setStyleSheet("color: #a0aec0; font-family: monospace; font-size: 9px; line-height: 1.4;")
+        self.lbl_diag_threads_list.setStyleSheet("color: #a0aec0; font-family: monospace; font-size: 9px; line-height: 1.4; border: none;")
         self.lbl_diag_threads_list.setWordWrap(True)
         sw_threads_box.addWidget(self.lbl_diag_threads_list)
 
         self.lbl_diag_proc_detail = QLabel("Process PID: -- | RAM RSS: -- MB | VMS: -- MB | Handles: OK")
-        self.lbl_diag_proc_detail.setStyleSheet("color: #718096; font-family: monospace; font-size: 9px;")
+        self.lbl_diag_proc_detail.setStyleSheet("color: #718096; font-family: monospace; font-size: 9px; border: none;")
+        self.lbl_diag_proc_detail.setWordWrap(True)
         sw_threads_box.addWidget(self.lbl_diag_proc_detail)
 
-        sw_layout.addLayout(sw_threads_box, 0, 0)
+        sw_threads_box.addStretch()
+        sw_layout.addWidget(threads_card, stretch=1)
 
-        # Sub-card: Runtime Environment & Libraries
-        sw_env_box = QVBoxLayout()
+        # Right Sub-card: Runtime Environment & Libraries
+        env_card = QFrame()
+        env_card.setStyleSheet(subcard_style)
+        sw_env_box = QVBoxLayout(env_card)
+        sw_env_box.setContentsMargins(10, 10, 10, 10)
         sw_env_box.setSpacing(6)
-        lbl_env_title = QLabel("Runtime Stack & Environment:")
-        lbl_env_title.setStyleSheet("font-weight: bold; color: #cbd5e0; font-size: 10px;")
+        lbl_env_title = QLabel("💻 Runtime Stack & Environment:")
+        lbl_env_title.setStyleSheet("font-weight: bold; color: #cbd5e0; font-size: 11px; border: none;")
         sw_env_box.addWidget(lbl_env_title)
 
         self.lbl_diag_os_info = QLabel(f"• Operating System: {platform.system()} {platform.release()} ({platform.machine()})")
-        self.lbl_diag_os_info.setStyleSheet("color: #cbd5e0; font-family: monospace; font-size: 9px;")
+        self.lbl_diag_os_info.setStyleSheet("color: #cbd5e0; font-family: monospace; font-size: 9px; border: none;")
+        self.lbl_diag_os_info.setWordWrap(True)
         sw_env_box.addWidget(self.lbl_diag_os_info)
 
         self.lbl_diag_python_info = QLabel(f"• Python Runtime: Python {platform.python_version()} (Virtualenv: active)")
-        self.lbl_diag_python_info.setStyleSheet("color: #cbd5e0; font-family: monospace; font-size: 9px;")
+        self.lbl_diag_python_info.setStyleSheet("color: #cbd5e0; font-family: monospace; font-size: 9px; border: none;")
+        self.lbl_diag_python_info.setWordWrap(True)
         sw_env_box.addWidget(self.lbl_diag_python_info)
 
         import cv2
         cv_ver = getattr(cv2, '__version__', 'N/A')
         torch_ver = getattr(torch, '__version__', 'N/A') if 'torch' in globals() and torch else 'N/A'
         self.lbl_diag_libs_info = QLabel(f"• Core Libraries: OpenCV {cv_ver} | PyTorch {torch_ver} (CPU Inference) | PyQt5")
-        self.lbl_diag_libs_info.setStyleSheet("color: #cbd5e0; font-family: monospace; font-size: 9px;")
+        self.lbl_diag_libs_info.setStyleSheet("color: #cbd5e0; font-family: monospace; font-size: 9px; border: none;")
+        self.lbl_diag_libs_info.setWordWrap(True)
         sw_env_box.addWidget(self.lbl_diag_libs_info)
 
         self.lbl_diag_uptimes = QLabel("• Uptime: App: -- | System: --")
-        self.lbl_diag_uptimes.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 9px; font-weight: bold;")
+        self.lbl_diag_uptimes.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 9px; font-weight: bold; border: none;")
+        self.lbl_diag_uptimes.setWordWrap(True)
         sw_env_box.addWidget(self.lbl_diag_uptimes)
 
-        sw_layout.addLayout(sw_env_box, 0, 1)
+        sw_env_box.addStretch()
+        sw_layout.addWidget(env_card, stretch=1)
         layout.addWidget(grp_sw)
 
         # ----------------------------------------------------
         # 5. GROUP: INDUSTRIAL RELAY & IPC TELEMETRY
         # ----------------------------------------------------
         grp_hw = QGroupBox("⚡ INDUSTRIAL RELAY & IPC TELEMETRY")
-        hw_layout = QGridLayout(grp_hw)
-        hw_layout.setContentsMargins(12, 12, 12, 12)
-        hw_layout.setSpacing(10)
+        hw_main_layout = QVBoxLayout(grp_hw)
+        hw_main_layout.setContentsMargins(10, 10, 10, 10)
+        hw_main_layout.setSpacing(10)
+
+        # Hardware Metrics Container
+        hw_metrics_card = QFrame()
+        hw_metrics_card.setStyleSheet(subcard_style)
+        hw_grid = QGridLayout(hw_metrics_card)
+        hw_grid.setContentsMargins(10, 10, 10, 10)
+        hw_grid.setSpacing(10)
 
         self.lbl_diag_ipc_status = QLabel("IPC Socket Status: CONNECTED (/dev/shm/forklift_relay.sock)")
-        self.lbl_diag_ipc_status.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px; font-weight: bold;")
-        hw_layout.addWidget(self.lbl_diag_ipc_status, 0, 0)
+        self.lbl_diag_ipc_status.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px; font-weight: bold; border: none;")
+        self.lbl_diag_ipc_status.setWordWrap(True)
+        hw_grid.addWidget(self.lbl_diag_ipc_status, 0, 0)
 
         self.lbl_diag_daemon_status = QLabel("Hardware Worker Daemon: RUNNING (PID: --)")
-        self.lbl_diag_daemon_status.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px; font-weight: bold;")
-        hw_layout.addWidget(self.lbl_diag_daemon_status, 0, 1)
+        self.lbl_diag_daemon_status.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px; font-weight: bold; border: none;")
+        self.lbl_diag_daemon_status.setWordWrap(True)
+        hw_grid.addWidget(self.lbl_diag_daemon_status, 0, 1)
 
         self.lbl_diag_port = QLabel(f"Active COM Port: {self.global_settings.get('com_port', '/dev/ttyUSB0')} @ 9600 bps")
-        self.lbl_diag_port.setStyleSheet("color: #cbd5e0; font-family: monospace; font-size: 10px;")
-        hw_layout.addWidget(self.lbl_diag_port, 1, 0)
+        self.lbl_diag_port.setStyleSheet("color: #cbd5e0; font-family: monospace; font-size: 10px; border: none;")
+        self.lbl_diag_port.setWordWrap(True)
+        hw_grid.addWidget(self.lbl_diag_port, 1, 0)
 
         self.lbl_diag_coil = QLabel("Hardware Coil Power: ENABLED (5V Bus Stabilized)")
-        self.lbl_diag_coil.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px;")
-        hw_layout.addWidget(self.lbl_diag_coil, 1, 1)
+        self.lbl_diag_coil.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px; border: none;")
+        self.lbl_diag_coil.setWordWrap(True)
+        hw_grid.addWidget(self.lbl_diag_coil, 1, 1)
 
         self.lbl_diag_ping = QLabel("Loopback Roundtrip Latency: < 0.8ms (Shared Memory Socket)")
-        self.lbl_diag_ping.setStyleSheet("color: #63b3ed; font-family: monospace; font-size: 10px;")
-        hw_layout.addWidget(self.lbl_diag_ping, 2, 0)
+        self.lbl_diag_ping.setStyleSheet("color: #63b3ed; font-family: monospace; font-size: 10px; border: none;")
+        self.lbl_diag_ping.setWordWrap(True)
+        hw_grid.addWidget(self.lbl_diag_ping, 2, 0)
 
         self.lbl_diag_timers = QLabel(f"Safety Timers: On-Delay: {self.relay_manager.on_delay}s | Off-Delay: {self.relay_manager.off_delay}s")
-        self.lbl_diag_timers.setStyleSheet("color: #cbd5e0; font-family: monospace; font-size: 10px;")
-        hw_layout.addWidget(self.lbl_diag_timers, 2, 1)
+        self.lbl_diag_timers.setStyleSheet("color: #cbd5e0; font-family: monospace; font-size: 10px; border: none;")
+        self.lbl_diag_timers.setWordWrap(True)
+        hw_grid.addWidget(self.lbl_diag_timers, 2, 1)
 
-        # 4-Channel Relay States Visual Indicators
-        relays_box = QHBoxLayout()
-        relays_box.setSpacing(10)
-        lbl_rel_title = QLabel("4-Channel Relay States:")
-        lbl_rel_title.setStyleSheet("font-size: 10px; font-weight: bold; color: #a0aec0;")
-        relays_box.addWidget(lbl_rel_title)
+        hw_main_layout.addWidget(hw_metrics_card)
+
+        # 4-Channel Relay States Visual Indicators Frame
+        relays_card = QFrame()
+        relays_card.setStyleSheet(subcard_style)
+        relays_layout = QVBoxLayout(relays_card)
+        relays_layout.setContentsMargins(10, 8, 10, 8)
+        relays_layout.setSpacing(6)
+
+        lbl_rel_title = QLabel("⚡ 4-Channel Relay Output States:")
+        lbl_rel_title.setStyleSheet("font-size: 10px; font-weight: bold; color: #a0aec0; border: none;")
+        relays_layout.addWidget(lbl_rel_title)
+
+        relays_h_box = QHBoxLayout()
+        relays_h_box.setSpacing(10)
 
         self.lbl_diag_relays = []
         for r in range(4):
             lbl_r = QLabel(f"Relay {r+1}: OFF")
             lbl_r.setStyleSheet("""
                 background-color: #1a202c; color: #a0aec0; border: 1px solid #4a5568;
-                border-radius: 4px; padding: 3px 8px; font-family: monospace; font-size: 9px; font-weight: bold;
+                border-radius: 4px; padding: 5px 12px; font-family: monospace; font-size: 10px; font-weight: bold;
             """)
-            relays_box.addWidget(lbl_r)
+            relays_h_box.addWidget(lbl_r)
             self.lbl_diag_relays.append(lbl_r)
-        relays_box.addStretch()
+        relays_h_box.addStretch()
+        relays_layout.addLayout(relays_h_box)
 
-        hw_layout.addLayout(relays_box, 3, 0, 1, 2)
+        hw_main_layout.addWidget(relays_card)
         layout.addWidget(grp_hw)
 
         # ----------------------------------------------------
@@ -3237,33 +3435,38 @@ class ForkliftSafetyGUI(QWidget):
         # ----------------------------------------------------
         grp_cam = QGroupBox("📹 AI VISION & USB TOPOLOGY")
         cam_main_layout = QVBoxLayout(grp_cam)
-        cam_main_layout.setContentsMargins(12, 12, 12, 12)
-        cam_main_layout.setSpacing(8)
+        cam_main_layout.setContentsMargins(10, 10, 10, 10)
+        cam_main_layout.setSpacing(10)
 
-        # AI Engine Specs
+        # AI Engine Specs Banner
         conf_val = self.global_settings.get("confidence", 0.32)
         model_name = self.global_settings.get("model_path", "yolov8n.pt")
         self.lbl_diag_ai_info = QLabel(f"🤖 Inference Engine: YOLOv8 ({os.path.basename(model_name)}) | Confidence: {conf_val*100:.0f}% | Mode: CPU Execution Engine")
-        self.lbl_diag_ai_info.setStyleSheet("color: #63b3ed; font-size: 10px; font-weight: bold;")
+        self.lbl_diag_ai_info.setStyleSheet("""
+            background-color: #161c28; border: 1px solid #232c3d; border-radius: 6px;
+            color: #63b3ed; font-size: 10px; font-weight: bold; padding: 8px 12px;
+        """)
+        self.lbl_diag_ai_info.setWordWrap(True)
         cam_main_layout.addWidget(self.lbl_diag_ai_info)
 
         # 4 Cameras Grid
         cam_grid = QGridLayout()
-        cam_grid.setSpacing(8)
+        cam_grid.setSpacing(10)
         self.lbl_diag_cams = []
         self.lbl_diag_cam_cards = []
 
         for i in range(4):
             cam_card = QFrame()
-            cam_card.setStyleSheet("background-color: #1a2230; border: 1px solid #2d3846; border-radius: 6px; padding: 6px;")
+            cam_card.setStyleSheet("background-color: #161c28; border: 1px solid #2d3846; border-radius: 6px; padding: 8px;")
             cam_c_layout = QVBoxLayout(cam_card)
-            cam_c_layout.setContentsMargins(6, 6, 6, 6)
-            cam_c_layout.setSpacing(3)
+            cam_c_layout.setContentsMargins(8, 8, 8, 8)
+            cam_c_layout.setSpacing(4)
 
             lbl_c_hdr = QLabel(f"📷 Station {i+1:02d}")
-            lbl_c_hdr.setStyleSheet("font-size: 11px; font-weight: bold; color: #ffffff;")
+            lbl_c_hdr.setStyleSheet("font-size: 11px; font-weight: bold; color: #ffffff; border: none;")
             lbl_c_detail = QLabel(f"Node /dev/video{i*2} - Auto USB\nStatus: STANDBY | FPS: 0.0")
-            lbl_c_detail.setStyleSheet("font-family: monospace; font-size: 9px; color: #a0aec0;")
+            lbl_c_detail.setStyleSheet("font-family: monospace; font-size: 9px; color: #a0aec0; border: none;")
+            lbl_c_detail.setWordWrap(True)
 
             cam_c_layout.addWidget(lbl_c_hdr)
             cam_c_layout.addWidget(lbl_c_detail)
@@ -3331,13 +3534,13 @@ class ForkliftSafetyGUI(QWidget):
                     max_temp = max(max_temp, pkg_cur)
                     color = "#e53e3e" if pkg_cur > 80 else ("#dd6b20" if pkg_cur > 65 else "#48bb78")
                     self.lbl_temp_cpu_pkg.setText(f"• CPU Package: {pkg_cur:.1f} °C (High: {pkg_entry.high or 84}°C, Crit: {pkg_entry.critical or 100}°C)")
-                    self.lbl_temp_cpu_pkg.setStyleSheet(f"font-family: monospace; font-size: 10px; color: {color}; font-weight: bold;")
+                    self.lbl_temp_cpu_pkg.setStyleSheet(f"font-family: monospace; font-size: 10px; color: {color}; font-weight: bold; border: none;")
 
                     # Cores
                     core_temps = [f"{e.current:.1f}°C" for e in entries if 'Core' in (e.label or '')]
                     if core_temps:
-                        self.lbl_temp_cpu_cores.setText(f"• CPU Cores: {', '.join(core_temps)}")
-                        self.lbl_temp_cpu_cores.setStyleSheet("font-family: monospace; font-size: 10px; color: #cbd5e0;")
+                        self.lbl_temp_cpu_cores.setText(f"• CPU Cores [0-3]: {', '.join(core_temps)}")
+                        self.lbl_temp_cpu_cores.setStyleSheet("font-family: monospace; font-size: 10px; color: #cbd5e0; border: none;")
 
                 # NVMe Storage
                 if 'nvme' in temps and temps['nvme']:
@@ -3346,7 +3549,7 @@ class ForkliftSafetyGUI(QWidget):
                     max_temp = max(max_temp, nvme_cur)
                     color = "#e53e3e" if nvme_cur > 70 else ("#dd6b20" if nvme_cur > 60 else "#63b3ed")
                     self.lbl_temp_nvme.setText(f"• NVMe SSD Storage: {nvme_cur:.1f} °C (Crit: {nvme_entry.critical or 94.85}°C)")
-                    self.lbl_temp_nvme.setStyleSheet(f"font-family: monospace; font-size: 10px; color: {color}; font-weight: bold;")
+                    self.lbl_temp_nvme.setStyleSheet(f"font-family: monospace; font-size: 10px; color: {color}; border: none;")
 
                 # PCH
                 if 'pch_skylake' in temps and temps['pch_skylake']:
@@ -3365,8 +3568,8 @@ class ForkliftSafetyGUI(QWidget):
                     self.bar_kpi_temp.setValue(min(100, int(max_temp)))
                     temp_color = "#e53e3e" if max_temp > 80 else ("#dd6b20" if max_temp > 65 else "#48bb78")
                     self.lbl_kpi_temp_val.setStyleSheet(f"font-size: 20px; font-weight: bold; color: {temp_color}; border: none;")
-                    status_text = "⚠️ ELEVATED" if max_temp > 75 else "🟢 NORMAL"
-                    self.lbl_kpi_temp_sub.setText(status_text)
+                    status_text = "⚠️ ELEVATED" if max_temp > 75 else "🟢 OPTIMAL"
+                    self.lbl_kpi_temp_sub.setText(f"CPU Package: {status_text}")
         except Exception:
             pass
 
@@ -3380,7 +3583,7 @@ class ForkliftSafetyGUI(QWidget):
                 used_gb = vmem.used / (1024 ** 3)
                 total_gb = vmem.total / (1024 ** 3)
                 free_disk_gb = disk.free / (1024 ** 3)
-                self.lbl_kpi_disk_sub.setText(f"RAM: {used_gb:.1f}/{total_gb:.1f} GB | Disk: {disk.percent:.0f}% (Free: {free_disk_gb:.1f} GB)")
+                self.lbl_kpi_disk_sub.setText(f"RAM: {used_gb:.1f}/{total_gb:.1f} GB • Disk Free: {free_disk_gb:.0f} GB")
         except Exception:
             pass
 
@@ -3415,7 +3618,7 @@ class ForkliftSafetyGUI(QWidget):
                 sys_mins = (sys_uptime_sec % 3600) // 60
                 sys_uptime_str = f"{sys_days}d {sys_hrs:02d}h {sys_mins:02d}m"
 
-                self.lbl_kpi_uptime_sub.setText(f"App: {app_uptime_str} | System: {sys_uptime_str}")
+                self.lbl_kpi_uptime_sub.setText(f"App Uptime: {app_uptime_str}")
                 self.lbl_diag_uptimes.setText(f"• Uptime: App: {app_uptime_str} | OS: {sys_uptime_str}")
         except Exception:
             pass
@@ -3437,18 +3640,18 @@ class ForkliftSafetyGUI(QWidget):
                     pass
 
         if is_hw_online and sock_exists:
-            self.lbl_diag_ipc_status.setText("IPC Socket Status: CONNECTED (/dev/shm/forklift_relay.sock)")
-            self.lbl_diag_ipc_status.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px; font-weight: bold;")
+            self.lbl_diag_ipc_status.setText("IPC Socket Status: 🟢 CONNECTED (/dev/shm/forklift_relay.sock)")
+            self.lbl_diag_ipc_status.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px; font-weight: bold; border: none;")
         else:
             self.lbl_diag_ipc_status.setText("IPC Socket Status: ⚠️ DISCONNECTED / FAULT")
-            self.lbl_diag_ipc_status.setStyleSheet("color: #f56565; font-family: monospace; font-size: 10px; font-weight: bold;")
+            self.lbl_diag_ipc_status.setStyleSheet("color: #f56565; font-family: monospace; font-size: 10px; font-weight: bold; border: none;")
 
         if hw_pid:
-            self.lbl_diag_daemon_status.setText(f"Hardware Worker Daemon: RUNNING (PID: {hw_pid})")
-            self.lbl_diag_daemon_status.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px; font-weight: bold;")
+            self.lbl_diag_daemon_status.setText(f"Hardware Worker Daemon: 🟢 RUNNING (PID: {hw_pid})")
+            self.lbl_diag_daemon_status.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px; font-weight: bold; border: none;")
         else:
             self.lbl_diag_daemon_status.setText("Hardware Worker Daemon: ⚠️ NOT RUNNING")
-            self.lbl_diag_daemon_status.setStyleSheet("color: #f56565; font-family: monospace; font-size: 10px; font-weight: bold;")
+            self.lbl_diag_daemon_status.setStyleSheet("color: #f56565; font-family: monospace; font-size: 10px; font-weight: bold; border: none;")
 
         # Active Port & Coil
         active_com = self.global_settings.get("com_port", "/dev/ttyUSB0")
@@ -3458,10 +3661,10 @@ class ForkliftSafetyGUI(QWidget):
         coil_state = getattr(self.relay_manager, "hardware_coil_enabled", 1)
         if coil_state:
             self.lbl_diag_coil.setText("Hardware Coil Power: ENABLED (Safety Interlock Powered)")
-            self.lbl_diag_coil.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px;")
+            self.lbl_diag_coil.setStyleSheet("color: #48bb78; font-family: monospace; font-size: 10px; border: none;")
         else:
             self.lbl_diag_coil.setText("Hardware Coil Power: DISABLED / MUTED")
-            self.lbl_diag_coil.setStyleSheet("color: #dd6b20; font-family: monospace; font-size: 10px;")
+            self.lbl_diag_coil.setStyleSheet("color: #dd6b20; font-family: monospace; font-size: 10px; border: none;")
 
         # Relay Channels States
         relay_states = getattr(self.relay_manager, "relay_states", [False, False, False, False])
@@ -3472,13 +3675,13 @@ class ForkliftSafetyGUI(QWidget):
                     self.lbl_diag_relays[r].setText(f"Relay {r+1}: 🔴 ON (ACTIVE)")
                     self.lbl_diag_relays[r].setStyleSheet("""
                         background-color: #742a2a; color: #feb2b2; border: 1px solid #e53e3e;
-                        border-radius: 4px; padding: 3px 8px; font-family: monospace; font-size: 9px; font-weight: bold;
+                        border-radius: 4px; padding: 5px 12px; font-family: monospace; font-size: 10px; font-weight: bold;
                     """)
                 else:
                     self.lbl_diag_relays[r].setText(f"Relay {r+1}: 🟢 IDLE (OFF)")
                     self.lbl_diag_relays[r].setStyleSheet("""
                         background-color: #1a202c; color: #a0aec0; border: 1px solid #4a5568;
-                        border-radius: 4px; padding: 3px 8px; font-family: monospace; font-size: 9px; font-weight: bold;
+                        border-radius: 4px; padding: 5px 12px; font-family: monospace; font-size: 10px; font-weight: bold;
                     """)
 
         # 6. Cameras & AI Vision Stations
@@ -3510,35 +3713,35 @@ class ForkliftSafetyGUI(QWidget):
             map_b = self.global_settings.get("relay_mapping_b", [0, 0, 0, 0])
             rel_a = map_a[i] if i < len(map_a) else 1
             rel_b = map_b[i] if i < len(map_b) else 0
-            rel_b_str = f"Ch{rel_b}" if rel_b > 0 else "Disabled"
+            rel_b_str = f"Ch{rel_b}" if rel_b > 0 else "None"
             detail = (
-                f"Node /dev/video{card.device_index} - USB: {phys}\n"
-                f"Status: {st_text} | FPS: {fps:.1f} fps\n"
-                f"Relays Assigned: Primary->Ch{rel_a} | Secondary->{rel_b_str}"
+                f"Node: /dev/video{card.device_index}  •  USB: {phys}\n"
+                f"Status: {st_text}  •  FPS: {fps:.1f} fps\n"
+                f"Relays Assigned: Primary -> Ch{rel_a}  •  Secondary -> {rel_b_str}"
             )
             self.lbl_diag_cams[i].setText(detail)
-            self.lbl_diag_cams[i].setStyleSheet(f"font-family: monospace; font-size: 9px; color: {color};")
+            self.lbl_diag_cams[i].setStyleSheet(f"font-family: monospace; font-size: 9px; color: {color}; border: none;")
             if i < len(self.lbl_diag_cam_cards):
-                self.lbl_diag_cam_cards[i].setStyleSheet(f"background-color: {card_bg}; border: 1px solid #2d3846; border-radius: 6px; padding: 6px;")
+                self.lbl_diag_cam_cards[i].setStyleSheet(f"background-color: {card_bg}; border: 1px solid #2d3846; border-radius: 6px; padding: 8px;")
 
         # Overall Status Badge
         if is_hw_online and sock_exists and hw_pid and all_cams_ok and max_temp < 80:
             self.lbl_diag_global_badge.setText("🟢 SYSTEM OPTIMAL")
             self.lbl_diag_global_badge.setStyleSheet("""
                 background-color: #1c4532; color: #48bb78; font-family: 'Segoe UI Semibold';
-                font-size: 11px; font-weight: bold; padding: 6px 12px; border-radius: 6px; border: 1px solid #2f855a;
+                font-size: 11px; font-weight: bold; padding: 6px 14px; border-radius: 6px; border: 1px solid #2f855a;
             """)
         elif not is_hw_online or not sock_exists:
             self.lbl_diag_global_badge.setText("🔴 HARDWARE FAULT")
             self.lbl_diag_global_badge.setStyleSheet("""
                 background-color: #742a2a; color: #feb2b2; font-family: 'Segoe UI Semibold';
-                font-size: 11px; font-weight: bold; padding: 6px 12px; border-radius: 6px; border: 1px solid #e53e3e;
+                font-size: 11px; font-weight: bold; padding: 6px 14px; border-radius: 6px; border: 1px solid #e53e3e;
             """)
         else:
             self.lbl_diag_global_badge.setText("⚠️ SYSTEM WARNING")
             self.lbl_diag_global_badge.setStyleSheet("""
                 background-color: #744210; color: #fbd38d; font-family: 'Segoe UI Semibold';
-                font-size: 11px; font-weight: bold; padding: 6px 12px; border-radius: 6px; border: 1px solid #d69e2e;
+                font-size: 11px; font-weight: bold; padding: 6px 14px; border-radius: 6px; border: 1px solid #d69e2e;
             """)
 
     def copy_diagnostics_report(self):
@@ -3715,12 +3918,11 @@ class ForkliftSafetyGUI(QWidget):
     # CONFIGURATION PERSISTENCE
     # ==========================================
     def load_global_settings(self):
-        config_path = "config.json"
         self.global_settings = {
             "com_port": "/dev/ttyUSB0" if sys.platform != "win32" else "COM3",
             "baud_rate": 9600,
-            "camera_mapping": [0, 2, 4, 6],
-            "camera_physical_paths": [None, None, None, None],
+            "camera_mapping": ["/dev/video0", "/dev/video2", "/dev/video4", "/dev/video6"],
+            "camera_physical_paths": list(DEFAULT_PHYSICAL_PATHS),
             "cameras_enabled": [True, True, True, True],
             "relay_mapping": [1, 2, 3, 4],
             "model_path": "yolov8n.pt",
@@ -3730,14 +3932,14 @@ class ForkliftSafetyGUI(QWidget):
             "boot_self_test": 1,
             "hardware_coil_enabled": 1
         }
-        if os.path.exists(config_path):
+        if os.path.exists(CONFIG_PATH):
             try:
-                with open(config_path, "r") as f:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if "settings" in data:
                     self.global_settings.update(data["settings"])
                 if "camera_physical_paths" not in self.global_settings or not any(self.global_settings.get("camera_physical_paths", [])):
-                    loaded_paths = [None, None, None, None]
+                    loaded_paths = list(DEFAULT_PHYSICAL_PATHS)
                     for i in range(4):
                         cam_k = f"camera_{i}"
                         if cam_k in data and "physical_usb_path" in data[cam_k]:
@@ -3782,11 +3984,10 @@ class ForkliftSafetyGUI(QWidget):
 
     def persist_camera_enabled_state(self):
         """Writes current camera enable/disable states directly to config.json."""
-        config_path = "config.json"
         try:
             data = {}
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f:
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
             if "settings" not in data:
                 data["settings"] = {}
@@ -3800,108 +4001,113 @@ class ForkliftSafetyGUI(QWidget):
                     data[cam_k] = {}
                 data[cam_k]["enabled"] = enabled_list[i] if i < len(enabled_list) else True
 
-            with open(config_path, "w") as f:
-                json.dump(data, f, indent=4)
+            safe_atomic_write_json(CONFIG_PATH, data)
             print(f"[CONFIG] Persisted camera enable/disable states: {enabled_list}")
         except Exception as e:
             print(f"[CONFIG] Error saving camera enable states: {e}")
 
     def save_global_configurations(self):
         role_level = self.access_levels.get(self.current_role, 1)
-        if role_level < 3:
-            QMessageBox.warning(self, "Access Denied", "Unauthorized attempt to modify configuration parameters.")
+        if role_level < 2:
+            QMessageBox.warning(self, "Access Denied", "System settings panel requires Supervisor or higher privileges.")
             return
 
-        self.global_settings["com_port"] = self.com_combo.currentText()
-        self.global_settings["baud_rate"] = int(self.baud_combo.currentText())
-        if hasattr(self, 'relay_a_dropdowns') and len(self.relay_a_dropdowns) >= 4:
-            self.global_settings["relay_mapping"] = [
-                self.relay_a_dropdowns[i].currentIndex() + 1 if self.relay_a_dropdowns[i].currentIndex() < 4 else 0 for i in range(4)
-            ]
-        elif hasattr(self, 'relay_dropdowns') and len(self.relay_dropdowns) >= 4:
-            self.global_settings["relay_mapping"] = [
-                self.relay_dropdowns[i].currentIndex() + 1 if self.relay_dropdowns[i].currentIndex() < 4 else 0 for i in range(4)
-            ]
-        if hasattr(self, 'relay_b_dropdowns') and len(self.relay_b_dropdowns) >= 4:
-            self.global_settings["relay_mapping_b"] = [
-                self.relay_b_dropdowns[i].currentIndex() + 1 if self.relay_b_dropdowns[i].currentIndex() < 4 else 0 for i in range(4)
-            ]
-        if hasattr(self, 'relay_a_active_checks') and len(self.relay_a_active_checks) >= 4:
-            self.global_settings["relay_a_active"] = [self.relay_a_active_checks[i].isChecked() for i in range(4)]
-        if hasattr(self, 'relay_b_active_checks') and len(self.relay_b_active_checks) >= 4:
-            self.global_settings["relay_b_active"] = [self.relay_b_active_checks[i].isChecked() for i in range(4)]
-        self.global_settings["model_path"] = self.model_input.text()
-        self.global_settings["confidence"] = self.conf_slider.value() / 100.0
-        self.global_settings["on_delay"] = self.on_delay_spin.value()
-        self.global_settings["off_delay"] = self.off_delay_spin.value()
-        self.global_settings["alarm_auto_reset"] = self.alarm_auto_reset_spin.value()
-        self.global_settings["boot_self_test"] = 1 if self.boot_test_check.isChecked() else 0
-        self.global_settings["hardware_coil_enabled"] = 1 if self.btn_coil_toggle.isChecked() else 0
-
-        self.relay_manager.update_delay_config(
-            self.global_settings["on_delay"],
-            self.global_settings["off_delay"]
-        )
-        self.relay_manager.update_boot_self_test(
-            self.global_settings["boot_self_test"] == 1
-        )
-        self.relay_manager.update_relay_mapping(
-            self.global_settings["relay_mapping"]
-        )
-        self.relay_manager.set_hardware_coil_enabled(
-            self.global_settings["hardware_coil_enabled"] == 1
-        )
-
-        config_path = "config.json"
-        data = {}
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
-
-        data["settings"] = self.global_settings
-        phys_paths = self.global_settings.get("camera_physical_paths", [None, None, None, None])
-        for i in range(4):
-            if i < len(phys_paths) and phys_paths[i]:
-                cam_k = f"camera_{i}"
-                if cam_k not in data:
-                    data[cam_k] = {}
-                data[cam_k]["physical_usb_path"] = phys_paths[i]
-
         try:
-            with open(config_path, "w") as f:
-                json.dump(data, f, indent=4)
-            
+            if hasattr(self, 'com_combo') and self.com_combo.currentText():
+                self.global_settings["com_port"] = self.com_combo.currentText()
+            if hasattr(self, 'baud_combo') and self.baud_combo.currentText():
+                try:
+                    self.global_settings["baud_rate"] = int(self.baud_combo.currentText())
+                except ValueError:
+                    self.global_settings["baud_rate"] = 9600
+            if hasattr(self, 'relay_a_dropdowns') and len(self.relay_a_dropdowns) >= 4:
+                self.global_settings["relay_mapping"] = [
+                    self.relay_a_dropdowns[i].currentIndex() + 1 if self.relay_a_dropdowns[i].currentIndex() < 4 else 0 for i in range(4)
+                ]
+            elif hasattr(self, 'relay_dropdowns') and len(self.relay_dropdowns) >= 4:
+                self.global_settings["relay_mapping"] = [
+                    self.relay_dropdowns[i].currentIndex() + 1 if self.relay_dropdowns[i].currentIndex() < 4 else 0 for i in range(4)
+                ]
+            if hasattr(self, 'relay_b_dropdowns') and len(self.relay_b_dropdowns) >= 4:
+                self.global_settings["relay_mapping_b"] = [
+                    self.relay_b_dropdowns[i].currentIndex() + 1 if self.relay_b_dropdowns[i].currentIndex() < 4 else 0 for i in range(4)
+                ]
+            if hasattr(self, 'relay_a_active_checks') and len(self.relay_a_active_checks) >= 4:
+                self.global_settings["relay_a_active"] = [self.relay_a_active_checks[i].isChecked() for i in range(4)]
+            if hasattr(self, 'relay_b_active_checks') and len(self.relay_b_active_checks) >= 4:
+                self.global_settings["relay_b_active"] = [self.relay_b_active_checks[i].isChecked() for i in range(4)]
+            if hasattr(self, 'model_input'):
+                self.global_settings["model_path"] = self.model_input.text()
+            if hasattr(self, 'conf_slider'):
+                self.global_settings["confidence"] = self.conf_slider.value() / 100.0
+            if hasattr(self, 'on_delay_spin'):
+                self.global_settings["on_delay"] = self.on_delay_spin.value()
+            if hasattr(self, 'off_delay_spin'):
+                self.global_settings["off_delay"] = self.off_delay_spin.value()
+            if hasattr(self, 'alarm_auto_reset_spin'):
+                self.global_settings["alarm_auto_reset"] = self.alarm_auto_reset_spin.value()
+            if hasattr(self, 'boot_test_check'):
+                self.global_settings["boot_self_test"] = 1 if self.boot_test_check.isChecked() else 0
+            if hasattr(self, 'btn_coil_toggle'):
+                self.global_settings["hardware_coil_enabled"] = 1 if self.btn_coil_toggle.isChecked() else 0
+
+            if self.relay_manager is not None:
+                self.relay_manager.update_delay_config(
+                    self.global_settings["on_delay"],
+                    self.global_settings["off_delay"]
+                )
+                self.relay_manager.update_boot_self_test(
+                    self.global_settings["boot_self_test"] == 1
+                )
+                self.relay_manager.update_relay_mapping(
+                    self.global_settings["relay_mapping"]
+                )
+                self.relay_manager.set_hardware_coil_enabled(
+                    self.global_settings["hardware_coil_enabled"] == 1
+                )
+
+            data = {}
+            if os.path.exists(CONFIG_PATH):
+                try:
+                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+
+            data["settings"] = self.global_settings
+            phys_paths = self.global_settings.get("camera_physical_paths", [None, None, None, None])
+            for i in range(4):
+                if i < len(phys_paths) and phys_paths[i]:
+                    cam_k = f"camera_{i}"
+                    if cam_k not in data:
+                        data[cam_k] = {}
+                    data[cam_k]["physical_usb_path"] = phys_paths[i]
+
+            safe_atomic_write_json(CONFIG_PATH, data)
             self.add_audit_log("Console configuration saved to config.json.", "success")
             
-            new_port = self.global_settings["com_port"]
-            new_baud = self.global_settings["baud_rate"]
-            self.add_audit_log(f"Re-connecting RM04U to saved port {new_port} at {new_baud} Baud...", "config")
-            self.relay_manager.baud_rate = new_baud
-            
-            self.pause_all_card_timers()
-            success, msg = self.relay_manager.connect_port(new_port)
-            self.resume_all_card_timers()
-            
-            if success:
-                self.add_audit_log(f"⚡ RM04U Saved Connection Success on {new_port}.", "success")
-            else:
-                self.add_audit_log(f"⚠️ RM04U Saved Connection Failure: {msg}", "warning")
+            new_port = self.global_settings.get("com_port", "/dev/ttyUSB0")
+            new_baud = self.global_settings.get("baud_rate", 9600)
+            if self.relay_manager is not None:
+                self.relay_manager.baud_rate = new_baud
+                success, msg = self.relay_manager.connect_port(new_port)
+                if success:
+                    self.add_audit_log(f"⚡ RM04U Saved Connection Success on {new_port}.", "success")
+                else:
+                    self.add_audit_log(f"⚠️ RM04U Saved Connection Failure: {msg}", "warning")
 
-            self.detector.confidence = self.global_settings["confidence"]
-            
-            # Reload YOLO model weights live on-the-fly
-            if self.detector.model_name != self.global_settings["model_path"]:
-                self.add_audit_log("System reloading YOLO model weights...", "config")
-                self.detector = YoloDetector(
-                    model_name=self.global_settings.get("model_name", self.global_settings.get("model_path", "yolov8n.pt")),
-                    confidence=self.global_settings["confidence"]
-                )
-                self.add_audit_log("YOLO model fully operational.", "success")
-                for card in self.cards:
-                    card.detector = self.detector
+            if hasattr(self, 'detector') and self.detector is not None:
+                self.detector.confidence = self.global_settings["confidence"]
+                target_model = self.global_settings.get("model_name", self.global_settings.get("model_path", "yolov8n.pt"))
+                if getattr(self.detector, 'model_name', None) != target_model:
+                    self.add_audit_log("System reloading YOLO model weights...", "config")
+                    self.detector = YoloDetector(
+                        model_name=target_model,
+                        confidence=self.global_settings["confidence"]
+                    )
+                    self.add_audit_log("YOLO model fully operational.", "success")
+                    for card in self.cards:
+                        card.detector = self.detector
             
             self.add_audit_log("Dynamic parameter mapping applied successfully.", "success")
             QMessageBox.information(self, "System Configured", "⚡ SCADA Operations parameters successfully updated.")
@@ -3916,6 +4122,11 @@ class ForkliftSafetyGUI(QWidget):
         self.global_settings["off_delay"] = self.off_delay_spin.value()
         self.global_settings["alarm_auto_reset"] = self.alarm_auto_reset_spin.value()
         self.global_settings["boot_self_test"] = 1 if self.boot_test_check.isChecked() else 0
+        if hasattr(self, 'conf_slider'):
+            conf_val = self.conf_slider.value() / 100.0
+            self.global_settings["confidence"] = conf_val
+            if hasattr(self, 'detector') and self.detector is not None:
+                self.detector.confidence = conf_val
         if hasattr(self, 'relay_a_dropdowns') and len(self.relay_a_dropdowns) >= 4:
             self.global_settings["relay_mapping"] = [
                 self.relay_a_dropdowns[i].currentIndex() + 1 if self.relay_a_dropdowns[i].currentIndex() < 4 else 0 for i in range(4)
@@ -3933,17 +4144,6 @@ class ForkliftSafetyGUI(QWidget):
         if hasattr(self, 'relay_b_active_checks') and len(self.relay_b_active_checks) >= 4:
             self.global_settings["relay_b_active"] = [self.relay_b_active_checks[i].isChecked() for i in range(4)]
         self.global_settings["hardware_coil_enabled"] = 1 if self.btn_coil_toggle.isChecked() else 0
-
-        # Synchronize camera cards with current relay mapping
-        if hasattr(self, 'cards'):
-            for i, card in enumerate(self.cards):
-                if getattr(card, 'relay_combo', None) and i < len(self.global_settings.get("relay_mapping", [])):
-                    rel_idx = self.global_settings["relay_mapping"][i] - 1
-                    card.relay_combo.blockSignals(True)
-                    card.relay_combo.setCurrentIndex(rel_idx)
-                    card.relay_combo.blockSignals(False)
-                    if getattr(card, 'btn_test_relay', None) and not card.btn_test_relay.isChecked():
-                        card.btn_test_relay.setText(f"⚡ TEST R{rel_idx + 1}")
 
         if self.relay_manager is not None:
             self.relay_manager.update_delay_config(
@@ -3960,11 +4160,10 @@ class ForkliftSafetyGUI(QWidget):
                 self.global_settings["hardware_coil_enabled"] == 1
             )
 
-        config_path = "config.json"
         data = {}
-        if os.path.exists(config_path):
+        if os.path.exists(CONFIG_PATH):
             try:
-                with open(config_path, "r") as f:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception:
                 data = {}
@@ -3983,8 +4182,7 @@ class ForkliftSafetyGUI(QWidget):
             data[cam_k]["enabled"] = enabled_list[i] if i < len(enabled_list) else True
 
         try:
-            with open(config_path, "w") as f:
-                json.dump(data, f, indent=4)
+            safe_atomic_write_json(CONFIG_PATH, data)
         except Exception:
             pass
 
@@ -4047,19 +4245,6 @@ class ForkliftSafetyGUI(QWidget):
             self.relay_buttons[index].setChecked(checked)
             self.relay_buttons[index].blockSignals(False)
 
-        # Synchronize UI state on all camera cards mapped to this relay
-        if hasattr(self, 'cards'):
-            for card in self.cards:
-                assigned_relay = self.global_settings.get("relay_mapping", [1, 2, 3, 4])[card.cam_id]
-                if assigned_relay == index + 1 and getattr(card, 'btn_test_relay', None):
-                    card.btn_test_relay.blockSignals(True)
-                    card.btn_test_relay.setChecked(checked)
-                    if checked:
-                        card.btn_test_relay.setText(f"⚡ R{index + 1} ON")
-                    else:
-                        card.btn_test_relay.setText(f"⚡ TEST R{index + 1}")
-                    card.btn_test_relay.blockSignals(False)
-
     def toggle_hardware_coil(self, checked):
         """Handles software coil toggle from the button."""
         if checked:
@@ -4104,6 +4289,7 @@ class ForkliftSafetyGUI(QWidget):
             self.update_ui_permissions()
             if self.stacked_widget.currentIndex() == 1:
                 self.show_live_page()
+            self.ensure_kiosk_foreground()
             self.add_audit_log("Role engagement updated: OPERATOR engaged.")
             return
 
@@ -4124,6 +4310,7 @@ class ForkliftSafetyGUI(QWidget):
             self.update_ui_permissions()
             self.add_audit_log(f"Authentication success: {role.upper()} granted.", "success")
             QMessageBox.information(self, "Access Granted", f"{role} Mode Enabled")
+            self.ensure_kiosk_foreground()
         else:
             self.add_audit_log(f"Authentication Failure: {role.upper()} login denied!", "warning")
             QMessageBox.warning(self, "Access Denied", "Wrong Credentials Password")
@@ -4163,43 +4350,48 @@ class ForkliftSafetyGUI(QWidget):
 
         for card in self.cards:
             card.btn_edit_roi.setEnabled(is_supervisor)
-            if getattr(card, 'relay_combo', None):
-                card.relay_combo.setEnabled(is_supervisor)
-            if getattr(card, 'btn_test_relay', None):
-                card.btn_test_relay.setEnabled(is_supervisor)
             # Force ROI Editor closure on downgrade
             if not is_supervisor and card.video_label.is_editable:
                 card.toggle_roi_edit()
 
-        # Tier 3+: Engineer permissions (Hardware serial connection, timing delays, AI model config)
+        # Configuration Controls & Save Button - Enabled for Supervisor and higher (Tier 2+)
         if hasattr(self, 'on_delay_spin'):
-            self.on_delay_spin.setEnabled(is_engineer)
+            self.on_delay_spin.setEnabled(is_supervisor)
         if hasattr(self, 'off_delay_spin'):
-            self.off_delay_spin.setEnabled(is_engineer)
+            self.off_delay_spin.setEnabled(is_supervisor)
         if hasattr(self, 'alarm_auto_reset_spin'):
-            self.alarm_auto_reset_spin.setEnabled(is_engineer)
+            self.alarm_auto_reset_spin.setEnabled(is_supervisor)
         if hasattr(self, 'boot_test_check'):
-            self.boot_test_check.setEnabled(is_engineer)
+            self.boot_test_check.setEnabled(is_supervisor)
         if hasattr(self, 'com_combo'):
-            self.com_combo.setEnabled(is_engineer)
+            self.com_combo.setEnabled(is_supervisor)
         if hasattr(self, 'baud_combo'):
-            self.baud_combo.setEnabled(is_engineer)
+            self.baud_combo.setEnabled(is_supervisor)
         if hasattr(self, 'btn_test_conn'):
-            self.btn_test_conn.setEnabled(is_engineer)
+            self.btn_test_conn.setEnabled(is_supervisor)
         if hasattr(self, 'model_input'):
-            self.model_input.setEnabled(is_engineer)
+            self.model_input.setEnabled(is_supervisor)
         if hasattr(self, 'conf_slider'):
-            self.conf_slider.setEnabled(is_engineer)
+            self.conf_slider.setEnabled(is_supervisor)
         if hasattr(self, 'btn_browse'):
-            self.btn_browse.setEnabled(is_engineer)
+            self.btn_browse.setEnabled(is_supervisor)
         if hasattr(self, 'btn_save_config'):
-            self.btn_save_config.setEnabled(is_engineer)
+            self.btn_save_config.setEnabled(is_supervisor)
 
         # Tier 4+: Admin permissions (Hardware coil cutoff, security credentials management)
         if hasattr(self, 'btn_coil_toggle'):
             self.btn_coil_toggle.setEnabled(is_admin)
         if hasattr(self, 'btn_change_password'):
             self.btn_change_password.setEnabled(is_admin)
+
+        # Dynamic GNOME Shell Super / Windows key unlocking for Supervisor
+        try:
+            if is_supervisor:
+                subprocess.run(["gsettings", "set", "org.gnome.mutter", "overlay-key", "Super_L"], timeout=0.5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                subprocess.run(["gsettings", "set", "org.gnome.mutter", "overlay-key", "''"], timeout=0.5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 
     def change_password(self):
         role_level = self.access_levels.get(self.current_role, 1)
@@ -4240,13 +4432,10 @@ class ForkliftSafetyGUI(QWidget):
     # ==========================================
     def evaluate_global_alarms(self):
         any_warning = False
-        any_active = False
 
         for card in self.cards:
-            if card.is_active:
-                any_active = True
-                if card.property("warning") == "true":
-                    any_warning = True
+            if card.is_active and card.property("warning") == "true":
+                any_warning = True
 
         hardware_online = getattr(self, 'hardware_is_online', True)
 

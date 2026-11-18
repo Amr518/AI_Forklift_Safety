@@ -1,35 +1,39 @@
 {
     "camera_0": {
-        "norm_x": 0.1,
-        "norm_y": 0.1,
-        "norm_w": 0.5,
-        "norm_h": 0.5,
-        "x": 45,
-        "y": 35,
-        "w": 225,
-        "h": 175,
-        "physical_usb_path": "1-1"
+        "norm_x": 0.0026,
+        "norm_y": 0.2103,
+        "norm_w": 0.9412,
+        "norm_h": 0.7897,
+        "x": 1,
+        "y": 53,
+        "w": 368,
+        "h": 199,
+        "physical_usb_path": "1-1",
+        "enabled": true
     },
     "camera_1": {
-        "norm_x": 0.0658,
-        "norm_y": 0.2343,
-        "norm_w": 0.8816,
-        "norm_h": 0.7486,
-        "x": 25,
-        "y": 82,
-        "w": 335,
-        "h": 262,
-        "physical_usb_path": "1-1"
+        "norm_x": 0.0691,
+        "norm_y": 0.3492,
+        "norm_w": 0.9028,
+        "norm_h": 0.6508,
+        "x": 27,
+        "y": 88,
+        "w": 353,
+        "h": 164,
+        "physical_usb_path": "1-5",
+        "enabled": true
     },
     "camera_2": {
-        "norm_x": 0.0632,
-        "norm_y": 0.1943,
-        "norm_w": 0.8921,
-        "norm_h": 0.7,
-        "x": 24,
-        "y": 68,
-        "w": 347,
-        "h": 245
+        "norm_x": 0.0102,
+        "norm_y": 0.3056,
+        "norm_w": 0.9821,
+        "norm_h": 0.6944,
+        "x": 4,
+        "y": 77,
+        "w": 384,
+        "h": 175,
+        "physical_usb_path": "1-2",
+        "enabled": true
     },
     "camera_3": {
         "norm_x": 0.05,
@@ -40,31 +44,38 @@
         "y": 56,
         "w": 355,
         "h": 256,
-        "physical_usb_path": "1-7"
+        "enabled": true,
+        "physical_usb_path": "1-4"
     },
     "settings": {
         "com_port": "/dev/ttyUSB0",
         "baud_rate": 9600,
         "camera_mapping": [
-            0,
-            2,
-            4,
-            6
+            "/dev/video0",
+            "/dev/video2",
+            "/dev/video4",
+            "/dev/video6"
         ],
         "camera_physical_paths": [
             "1-1",
-            "1-1",
-            null,
-            "1-7"
+            "1-5",
+            "1-2",
+            "1-4"
+        ],
+        "cameras_enabled": [
+            true,
+            true,
+            true,
+            true
         ],
         "relay_mapping": [
+            2,
             1,
             1,
-            1,
-            0
+            2
         ],
         "model_path": "yolov8n.pt",
-        "confidence": 0.32,
+        "confidence": 0.34,
         "on_delay": 0.2,
         "off_delay": 10.0,
         "boot_self_test": 1,
@@ -72,9 +83,9 @@
         "alarm_auto_reset": 20.0,
         "relay_mapping_b": [
             1,
-            0,
-            4,
-            3
+            1,
+            1,
+            1
         ],
         "relay_a_active": [
             true,

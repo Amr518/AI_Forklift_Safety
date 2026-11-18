@@ -76,7 +76,14 @@ fi
 
 echo "[LAUNCHER] Socket ready. Launching GUI..."
 
-# 8. Launch the AI GUI (Socket IPC Client) in fullscreen kiosk mode
+# 8. Configure GNOME Kiosk environment: disable hot corners, lock Super key for Operator, and dismiss Overview
+gsettings set org.gnome.desktop.interface enable-hot-corners false 2>/dev/null
+gsettings set org.gnome.mutter overlay-key '' 2>/dev/null
+gsettings set org.gnome.mutter dynamic-workspaces true 2>/dev/null
+gsettings set org.gnome.desktop.wm.preferences num-workspaces 4 2>/dev/null
+gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell --method org.freedesktop.DBus.Properties.Set org.gnome.Shell OverviewActive "<false>" 2>/dev/null
+
+# Launch the AI GUI (Socket IPC Client) in fullscreen kiosk mode
 export QT_QPA_PLATFORM=xcb
 python3 ai_gui_system.py
 EXIT_CODE=$?

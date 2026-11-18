@@ -17,13 +17,34 @@ class Camera:
 
     def initialize_camera(self):
         try:
-            self.cap = cv2.VideoCapture(self.device_index)
-            if self.cap is not None:
+            dev = self.device_index
+            if isinstance(dev, str) and dev.isdigit():
+                dev = int(dev)
+            self.cap = cv2.VideoCapture(dev)
+            if self.cap is not None and self.cap.isOpened():
+                try:
+                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                except Exception:
+                    pass
+                try:
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            elif self.cap is not None and not self.cap.isOpened():
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
         except Exception:
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
             self.cap = None
-
 
     def read_frame(self):
         """
@@ -47,6 +68,9 @@ class Camera:
         Releases the OpenCV capture hardware.
         """
         if self.cap is not None:
-            if self.cap.isOpened():
-                self.cap.release()
+            try:
+                if self.cap.isOpened():
+                    self.cap.release()
+            except Exception:
+                pass
             self.cap = None
